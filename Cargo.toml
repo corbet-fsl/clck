@@ -1,0 +1,37 @@
+[package]
+name = "clck"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.89"
+license = "FSL-1.1-ALv2"
+description = "A Wayland session locker that keeps kiosk outputs live while locking the rest, with PAM unlock"
+repository = "https://github.com/corbet-labs/clck"
+homepage = "https://github.com/corbet-labs/clck"
+
+[lib]
+name = "clck"
+path = "src/lib.rs"
+
+[[bin]]
+name = "clck"
+path = "src/bin/clck.rs"
+
+[dependencies]
+smithay-client-toolkit = "0.20"
+wayland-client = "0.31"
+calloop = "0.14"
+calloop-wayland-source = "0.4"
+tiny-skia = "0.11"
+fontdue = "0.9"
+pam-client = "0.5"
+zeroize = "1"
+# Only for the SIGUSR1 disposition (see locker.rs). Already in the tree via rustix/wayland; taken
+# directly rather than calloop's `signals` feature, which would pull the whole `nix` crate in to
+# deliver one signal.
+libc = "0.2"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = 2
