@@ -1,4 +1,4 @@
-# Replace 0303db174d8e31343bc6ee3194daa9a0f53787cf with one verified ccid commit before committing this adapter.
+# Replace 85e316579ea938c42a4e45d42cb3ac94aa2d9328 with one verified ccid commit before committing this adapter.
 when:
   - event: manual
 skip_clone: true
@@ -26,7 +26,7 @@ steps:
   - name: selected-checks
     image: bash
     environment:
-      CCID_REVISION: '0303db174d8e31343bc6ee3194daa9a0f53787cf'
+      CCID_REVISION: '85e316579ea938c42a4e45d42cb3ac94aa2d9328'
     commands:
       - |
         set -eu
