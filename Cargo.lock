@@ -180,7 +180,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "clck"
+name = "clck-kiosk"
 version = "0.1.0"
 dependencies = [
  "calloop",
