@@ -72,12 +72,12 @@ jobs:
             *) echo "::error::crates.io lookup returned HTTP $status"; exit 1 ;;
           esac
 
-      # pam-sys (bindgen), xkbcommon and wayland-sys need system headers to build.
+      # pam-sys (bindgen needs libclang), xkbcommon and wayland-sys need system headers to build.
       - name: Install native build dependencies
         if: steps.registry.outputs.published == 'false'
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends libpam0g-dev libxkbcommon-dev libwayland-dev
+          sudo apt-get install -y --no-install-recommends libclang-dev libpam0g-dev libxkbcommon-dev libwayland-dev
       - name: Set up current stable Rust
         if: steps.registry.outputs.published == 'false'
         run: rustup toolchain install stable --profile minimal
