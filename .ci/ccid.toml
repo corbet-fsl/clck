@@ -5,3 +5,14 @@ project = "clck"
 [checks.rust]
 kind = "cargo"
 actions = ["fmt", "test", "clippy"]
+cache_tools = [["rustc", "-vV"], ["cargo", "--version"], ["clang", "--version"], ["pkg-config", "--version"]]
+cache_env = ["LIBCLANG_PATH", "LD_LIBRARY_PATH", "PKG_CONFIG_PATH", "NIX_CFLAGS_COMPILE", "NIX_LDFLAGS", "CC", "CXX", "BINDGEN_EXTRA_CLANG_ARGS"]
+
+[render]
+tool_revision = "81ebac8e86e20bc93b69d5e912bbcb0c0d036d58"
+
+[jobs.verify]
+scheduler = "crow"
+checks = ["rust"]
+workflow = "repository-jobs"
+command = ["bash", ".ci/run-cached.sh"]
