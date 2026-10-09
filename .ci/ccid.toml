@@ -9,7 +9,7 @@ cache_tools = [["rustc", "-vV"], ["cargo", "--version"], ["clang", "--version"],
 cache_env = ["LIBCLANG_PATH", "LD_LIBRARY_PATH", "PKG_CONFIG_PATH", "NIX_CFLAGS_COMPILE", "NIX_LDFLAGS", "CC", "CXX", "BINDGEN_EXTRA_CLANG_ARGS"]
 
 [render]
-tool_revision = "972722d4e488b6fb49a5971d91720c47f30484d6"
+tool_revision = "78a4e05b4e1cb25aaeba3966951564d74277bcbd"
 
 [jobs.verify]
 scheduler = "crow"
