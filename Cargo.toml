@@ -2,7 +2,6 @@
 name = "clck-kiosk"
 version = "0.1.1"
 edition = "2021"
-rust-version = "1.89"
 license = "FSL-1.1-ALv2"
 description = "A Wayland session locker that keeps kiosk outputs live while locking the rest, with PAM unlock"
 repository = "https://github.com/corbet-libs/clck"

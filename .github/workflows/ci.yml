@@ -59,9 +59,6 @@ jobs:
               raise SystemExit('Select existing .ci/ccid.toml checks; empty selectors are invalid')
           if len(set(selectors)) != len(selectors):
               raise SystemExit('Each check may be selected only once')
-          minimum = package['rust-version']
-          if not re.fullmatch(r'\d+\.\d+(?:\.\d+)?', minimum):
-              raise SystemExit('Cargo rust-version must declare a numeric minimum')
           with open(os.environ['GITHUB_ENV'], 'a') as environment:
               environment.write('CI_COMMIT_SHA=' + os.environ['GITHUB_SHA'] + '\n')
               environment.write('SOURCE_SHA256=' + os.environ['SOURCE_SHA256'] + '\n')
