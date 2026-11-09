@@ -5,7 +5,7 @@ unlock. A kiosk output shows whatever a client (e.g. cksk) streams over the disp
 socket -- or the built-in clock until a frame arrives. No nix required.
 
 ```console
-$ cargo build --release
+$ cargo build --release --config .cargo/release-profile.toml
 $ ./target/release/clck --help
 ```
 

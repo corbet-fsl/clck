@@ -1,0 +1,6 @@
+# Release profile for this repo's release builds (rule 2: the fleet profile from
+# CARGO_HOME is the only auto-loaded profile, so no [profile.*] tables live in
+# manifests). Release builds pass this file explicitly:
+# cargo build --release --config .cargo/release-profile.toml
+[profile.release]
+opt-level = 2
