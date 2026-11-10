@@ -83,7 +83,7 @@ fn kiosk_on_draws_the_overlay_and_off_removes_it() {
     .unwrap();
     std::fs::write(
         cfg.join("compositor.conf"),
-        "output HEADLESS-1 mode 640x360\n",
+        "output HEADLESS-1 mode 640x360 pos 0 0\noutput HEADLESS-2 mode 640x360 pos 640 0\n",
     )
     .unwrap();
 
@@ -101,7 +101,8 @@ fn kiosk_on_draws_the_overlay_and_off_removes_it() {
     comp.arg("-c").arg(cfg.join("compositor.conf"));
     comp.env("WLR_BACKENDS", "headless")
         .env("WLR_LIBINPUT_NO_DEVICES", "1")
-        .env("WLR_RENDERER", "pixman");
+        .env("WLR_RENDERER", "pixman")
+        .env("WLR_HEADLESS_OUTPUTS", "2");
     env(&mut comp);
     guard.0.push(comp.spawn().unwrap());
     wait("the compositor's socket", || {
@@ -134,10 +135,10 @@ fn kiosk_on_draws_the_overlay_and_off_removes_it() {
             String::from_utf8_lossy(&o.stdout).into_owned(),
         )
     };
-    let shot = |name: &str| -> usize {
+    let shot = |name: &str, output: &str| -> usize {
         let f = rt.join(format!("{name}.ppm"));
         let mut g = Command::new("grim");
-        g.args(["-t", "ppm"]).arg(&f);
+        g.args(["-t", "ppm", "-o", output]).arg(&f);
         env(&mut g);
         g.env("WAYLAND_DISPLAY", display);
         assert!(g.status().unwrap().success(), "grim {name}");
@@ -146,15 +147,25 @@ fn kiosk_on_draws_the_overlay_and_off_removes_it() {
 
     let (ok, out) = kiosk("status");
     assert!(ok && out.contains(r#""kiosk":"off""#), "{out}");
-    assert_eq!(shot("a-off"), 0, "nothing painted before the command");
+    assert_eq!(
+        shot("a1", "HEADLESS-1"),
+        0,
+        "nothing painted before the command"
+    );
+    assert_eq!(shot("a2", "HEADLESS-2"), 0);
     let (ok, out) = kiosk("on");
     assert!(
-        ok && out.contains(r#""kiosk":"on""#) && out.contains("HEADLESS-1"),
-        "{out}"
+        ok && out.contains(r#""kiosk":"on""#) && out.contains(r#"["HEADLESS-1"]"#),
+        "only the named output: {out}"
     );
-    wait("the overlay", || shot("b-on") > 0);
+    wait("the overlay", || shot("b1", "HEADLESS-1") > 0);
+    assert_eq!(
+        shot("b2", "HEADLESS-2"),
+        0,
+        "an output that is not a kiosk output stays untouched"
+    );
     let (ok, out) = kiosk("off");
     assert!(ok && out.contains(r#""kiosk":"off""#), "{out}");
-    wait("the overlay to go", || shot("c-off") == 0);
+    wait("the overlay to go", || shot("c1", "HEADLESS-1") == 0);
     drop(guard);
 }

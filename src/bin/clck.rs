@@ -6,6 +6,8 @@
 
 use clck::{run, run_daemonized, Config};
 
+use serde::Deserialize;
+
 #[derive(serde::Deserialize, Default)]
 struct FileCfg {
     #[serde(default)]
@@ -18,12 +20,22 @@ struct FileCfg {
     debug: bool,
     #[serde(default)]
     fingerprint_pam_service: Option<String>,
-    /// `clck kioskd` / `clck kiosk` only (the lock-less kiosk): where the control command connects.
-    #[serde(default)]
+    /// `clck kioskd` / `clck kiosk` only (the lock-less kiosk): where the control command connects. Lenient on purpose: a
+    /// wrongly typed value is ignored, because a parse error here would drop the LOCKER's own keys (pam_service,
+    /// kiosk_outputs) and lock with the wrong PAM service.
+    #[serde(default, deserialize_with = "lenient_string")]
     control_socket_path: Option<String>,
-    /// `clck kioskd` only: where a frame client streams (never the locker's `socket_path`).
-    #[serde(default)]
+    /// `clck kioskd` only: where a frame client streams (never the locker's `socket_path`). Lenient like the above.
+    #[serde(default, deserialize_with = "lenient_string")]
     live_socket_path: Option<String>,
+}
+
+/// A string, or nothing for any other JSON value.
+fn lenient_string<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    Ok(match serde_json::Value::deserialize(d)? {
+        serde_json::Value::String(s) => Some(s),
+        _ => None,
+    })
 }
 
 fn main() {
@@ -239,6 +251,43 @@ mod tests {
                 "{later} is parsed first"
             );
         }
+    }
+
+    #[test]
+    fn the_kiosk_words_are_dispatched_after_the_child_and_before_the_lockers_argument_loop() {
+        let main = include_str!("clck.rs")
+            .split("fn main()")
+            .nth(1)
+            .expect("main");
+        let child = main.find("fingerprint_child_if_requested()").unwrap();
+        let check = main.find("--check-auth").unwrap();
+        let kioskd = main.find("Some(\"kioskd\")").unwrap();
+        let kiosk = main.find("Some(\"kiosk\")").unwrap();
+        let arg_loop = main.find("\"-f\" | \"--daemonize\"").unwrap();
+        assert!(
+            child < kioskd && check < kioskd,
+            "the hidden child and --check-auth keep their place"
+        );
+        assert!(
+            kioskd < arg_loop && kiosk < arg_loop,
+            "never reaches the locker's loop"
+        );
+        // each kiosk branch returns: it cannot fall through into the lock
+        assert!(main[kioskd..arg_loop].contains("return kioskd_mode()"));
+        assert!(main[kiosk..arg_loop].contains("return kiosk_mode("));
+    }
+
+    #[test]
+    fn a_wrongly_typed_kiosk_key_cannot_take_the_lockers_keys_with_it() {
+        let f: FileCfg = serde_json::from_str(
+            r#"{"pam_service":"clck","kiosk_outputs":["DP-3"],"control_socket_path":5,"live_socket_path":["x"]}"#,
+        )
+        .unwrap();
+        assert_eq!(f.pam_service.as_deref(), Some("clck"));
+        assert_eq!(f.kiosk_outputs, vec!["DP-3".to_string()]);
+        assert!(f.control_socket_path.is_none() && f.live_socket_path.is_none());
+        let f: FileCfg = serde_json::from_str(r#"{"live_socket_path":"/run/x.sock"}"#).unwrap();
+        assert_eq!(f.live_socket_path.as_deref(), Some("/run/x.sock"));
     }
 
     #[test]
