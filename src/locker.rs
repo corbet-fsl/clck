@@ -9,24 +9,27 @@ use crate::auth::{self, AuthAttempt, AuthOutcome, AuthResult};
 use crate::content::{AuthState, AuthView, Frame, KioskContent, OutputRole};
 use crate::daemon::{self, ForkRole, ReadyNotifier};
 use crate::diagnostics::Diagnostics;
+use crate::fingerprint::{self, FingerprintPath, Trigger};
 use crate::lockscreen::ClockLockScreen;
 use crate::socket::{self, SocketState};
 use calloop::{
     channel::{channel, Event as ChanEvent},
+    generic::Generic,
     ping::make_ping,
     timer::{TimeoutAction, Timer},
-    EventLoop,
+    EventLoop, Interest, LoopHandle, Mode, PostAction,
 };
 use calloop_wayland_source::WaylandSource;
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState},
-    delegate_compositor, delegate_keyboard, delegate_output, delegate_registry, delegate_seat,
-    delegate_session_lock, delegate_shm,
+    delegate_compositor, delegate_keyboard, delegate_output, delegate_pointer, delegate_registry,
+    delegate_seat, delegate_session_lock, delegate_shm,
     output::{OutputHandler, OutputState},
     registry::{ProvidesRegistryState, RegistryState},
     registry_handlers,
     seat::{
         keyboard::{KeyEvent, KeyboardHandler, Keysym, Modifiers, RawModifiers},
+        pointer::{PointerEvent, PointerEventKind, PointerHandler},
         Capability, SeatHandler, SeatState,
     },
     session_lock::{
@@ -35,13 +38,17 @@ use smithay_client_toolkit::{
     },
     shm::{slot::SlotPool, Shm, ShmHandler},
 };
-use std::path::PathBuf;
+use std::os::fd::OwnedFd;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 use wayland_client::{
     globals::registry_queue_init,
-    protocol::{wl_keyboard::WlKeyboard, wl_output, wl_seat::WlSeat, wl_shm, wl_surface},
+    protocol::{
+        wl_keyboard::WlKeyboard, wl_output, wl_pointer::WlPointer, wl_seat::WlSeat, wl_shm,
+        wl_surface,
+    },
     Connection, QueueHandle,
 };
 use zeroize::Zeroizing;
@@ -66,6 +73,14 @@ pub struct Config {
     /// systemd unit captures stderr in journald. No password content, length, key symbol, PAM
     /// prompt, or PAM message is ever included.
     pub debug: bool,
+    /// OPTIONAL second way in, in parallel with the password (`SESSION-2`): the PAM service of a
+    /// fingerprint reader (`/etc/pam.d/<name>`, e.g. one `auth required pam_fprintd.so` line).
+    /// `None` -- the default -- means no fingerprint path at all: no child process, no pointer
+    /// binding, no behaviour change. The service must be a plain lowercase name, must exist in
+    /// `/etc/pam.d`, and must differ from `pam_service`; otherwise it is refused and the locker
+    /// stays password-only. The binary that calls [`run`] must not treat clck's hidden child
+    /// argument as its own: `run`, `run_daemonized` and [`Builder::run`] dispatch it first.
+    pub fingerprint_pam_service: Option<String>,
 }
 
 #[non_exhaustive]
@@ -123,6 +138,7 @@ fn install_sigusr1_handler() -> bool {
 /// clock, until a frame arrives or after the streaming client disconnects. Blocks until the
 /// correct password unlocks the whole session.
 pub fn run(config: Config) -> Result<(), LockError> {
+    fingerprint::run_child_if_requested();
     run_inner(config, Box::new(ClockLockScreen::new()), None)
 }
 
@@ -131,6 +147,7 @@ pub fn run(config: Config) -> Result<(), LockError> {
 /// swayidle: a successful hook means the session is already secured, while the child continues to
 /// own the lock and authenticate the user.
 pub fn run_daemonized(config: Config) -> Result<(), LockError> {
+    fingerprint::run_child_if_requested();
     match daemon::fork().map_err(|e| LockError::Daemonize(e.to_string()))? {
         ForkRole::Parent(waiter) => waiter
             .wait()
@@ -165,6 +182,7 @@ impl Builder {
         self
     }
     pub fn run(self) -> Result<(), LockError> {
+        fingerprint::run_child_if_requested();
         let session = self
             .session
             .unwrap_or_else(|| Box::new(ClockLockScreen::new()));
@@ -207,6 +225,35 @@ fn run_inner(
     let seat_state = SeatState::new(&globals, &qh);
     let session_lock_state = SessionLockState::new(&globals, &qh);
 
+    // SESSION-2: only when configured, and only for a service that passes the checks.
+    let fingerprint = config
+        .fingerprint_pam_service
+        .as_deref()
+        .and_then(|service| {
+            match fingerprint::service_problem(
+                service,
+                Some(&config.pam_service),
+                Path::new(fingerprint::PAM_DIR),
+            ) {
+                Some(problem) => {
+                    eprintln!(
+                        "clck: fingerprint: service {service:?} refused ({problem}); password only"
+                    );
+                    None
+                }
+                None => {
+                    eprintln!(
+                        "clck: fingerprint: service={service:?}, in parallel with the password"
+                    );
+                    Some(FingerprintPath::new(
+                        service.to_string(),
+                        username.clone(),
+                        config.debug,
+                    ))
+                }
+            }
+        });
+
     let (attempt_tx, attempt_rx) = mpsc::channel::<AuthAttempt>();
     let (result_tx, result_ch) = channel::<AuthResult>();
     auth::spawn(
@@ -246,6 +293,7 @@ fn run_inner(
         socket: socket_state,
         socket_path,
         keyboard: None,
+        pointer: None,
         password: Zeroizing::new(String::new()),
         caps_lock: false,
         failed: false,
@@ -256,6 +304,8 @@ fn run_inner(
         next_attempt_id: 1,
         diagnostics,
         daemon_ready,
+        fingerprint,
+        loop_handle: None,
     };
 
     event_queue
@@ -272,9 +322,10 @@ fn run_inner(
     locker.diagnostics.lock_requested();
     locker.lock = Some(lock);
 
-    let mut event_loop: EventLoop<Locker> =
+    let mut event_loop: EventLoop<'static, Locker> =
         EventLoop::try_new().map_err(|e| LockError::Wayland(e.to_string()))?;
     let handle = event_loop.handle();
+    locker.loop_handle = Some(handle.clone());
     WaylandSource::new(conn, event_queue)
         .insert(handle.clone())
         .map_err(|e| LockError::Wayland(e.to_string()))?;
@@ -294,6 +345,7 @@ fn run_inner(
                 eprintln!("clck: SIGUSR1: re-showing the password indicator");
                 l.diagnostics.sigusr1();
             }
+            l.fingerprint_tick();
             l.redraw_all();
             TimeoutAction::ToDuration(Duration::from_secs(1))
         })
@@ -361,6 +413,9 @@ struct Locker {
     /// already-active locker and must not be unlinked (DISPLAY-3).
     socket_path: Option<PathBuf>,
     keyboard: Option<WlKeyboard>,
+    /// Bound only when the fingerprint path is configured: pointer input re-arms the reader and is
+    /// otherwise ignored (`SESSION-2`, `KIOSK-1`).
+    pointer: Option<WlPointer>,
     password: Zeroizing<String>,
     caps_lock: bool,
     failed: bool,
@@ -378,6 +433,18 @@ struct Locker {
     diagnostics: Diagnostics,
     /// Present only for `-f`; consumed once the compositor confirms the session lock is held.
     daemon_ready: Option<ReadyNotifier>,
+    /// `SESSION-2`. `None` unless `fingerprint_pam_service` is configured and passed its checks.
+    fingerprint: Option<FingerprintPath>,
+    /// Lets the fingerprint path watch a child's pidfd, so a verified finger unlocks at once
+    /// rather than on the next 1 s tick. Set once the event loop exists.
+    loop_handle: Option<LoopHandle<'static, Locker>>,
+}
+
+/// Which PAM transaction verified. Both reach the compositor through the one `unlock_and_exit`.
+#[derive(Clone, Copy)]
+enum UnlockSource {
+    Password(u64),
+    Fingerprint(u64),
 }
 
 impl Locker {
@@ -421,6 +488,10 @@ impl Locker {
         let lock_surface = session_lock.create_lock_surface(surface, &output, qh);
         eprintln!("clck:   '{name}' -> {role:?} ({reason})");
         self.diagnostics.output_surface_added(&name, role, reason);
+        if reason != "initial-lock" {
+            // A display came back (the lid opened, a dock woke up): re-arm the reader (SESSION-2).
+            self.fingerprint_trigger(Trigger::Wake);
+        }
         self.surfaces.push(Entry {
             output,
             surface: lock_surface,
@@ -634,24 +705,82 @@ impl Locker {
         }
     }
 
+    /// The ONE place clck asks the compositor to unlock (`LOCK-2`): a PAM success from the password
+    /// service, or (when configured) from the fingerprint service (`SESSION-1`, `SESSION-2`).
+    fn unlock_and_exit(&mut self, source: UnlockSource) -> ! {
+        match source {
+            UnlockSource::Password(id) => self.diagnostics.unlock_requested(id),
+            UnlockSource::Fingerprint(generation) => {
+                self.diagnostics.fingerprint_unlock_requested(generation)
+            }
+        }
+        if let Some(fingerprint) = self.fingerprint.as_mut() {
+            fingerprint.kill_all(); // release the reader now; the child's PDEATHSIG is the backstop
+        }
+        if let Some(lock) = self.lock.take() {
+            lock.unlock();
+        }
+        let flushed = self.conn.flush(); // push unlock_and_destroy before exit
+        self.diagnostics.unlock_flushed(flushed.is_ok());
+        if let Err(e) = flushed {
+            eprintln!("clck: unlock flush failed: {e}");
+        }
+        match source {
+            UnlockSource::Password(id) => self.diagnostics.authenticated_exit(id),
+            UnlockSource::Fingerprint(generation) => self.diagnostics.fingerprint_exit(generation),
+        }
+        std::process::exit(0);
+    }
+
+    /// Feed one trigger to the fingerprint path (a no-op when it is not configured).
+    fn fingerprint_trigger(&mut self, trigger: Trigger) {
+        let Some(fingerprint) = self.fingerprint.as_mut() else {
+            return;
+        };
+        if fingerprint.trigger(trigger, &self.diagnostics) {
+            self.drive_fingerprint();
+        }
+    }
+
+    /// The 1 s tick's share: notice a resume, reap, enforce the attempt deadline.
+    fn fingerprint_tick(&mut self) {
+        let Some(fingerprint) = self.fingerprint.as_mut() else {
+            return;
+        };
+        fingerprint.tick(&self.diagnostics);
+        self.drive_fingerprint();
+    }
+
+    /// Let the fingerprint path reap, classify, kill and spawn; unlock if the attempt in flight
+    /// verified. Runs on the event loop thread only, so it is ordered with every other event.
+    fn drive_fingerprint(&mut self) {
+        let Some(fingerprint) = self.fingerprint.as_mut() else {
+            return;
+        };
+        let handle = self.loop_handle.clone();
+        let mut watch = |fd: OwnedFd| {
+            if let Some(handle) = handle.as_ref() {
+                // A failed registration only costs latency: the 1 s tick polls the child as well.
+                let _ = handle.insert_source(
+                    Generic::new(fd, Interest::READ, Mode::Level),
+                    |_, _, l: &mut Locker| {
+                        l.drive_fingerprint();
+                        Ok(PostAction::Remove)
+                    },
+                );
+            }
+        };
+        if let Some(generation) = fingerprint.step(&self.diagnostics, &mut watch) {
+            self.unlock_and_exit(UnlockSource::Fingerprint(generation));
+        }
+    }
+
     fn on_auth(&mut self, result: AuthResult) {
         let AuthResult { id, outcome } = result;
         self.diagnostics.auth_result_received(id, outcome);
         self.verifying = false;
         match outcome {
-            AuthOutcome::Unlocked => {
-                self.diagnostics.unlock_requested(id);
-                if let Some(lock) = self.lock.take() {
-                    lock.unlock();
-                }
-                let flushed = self.conn.flush(); // push unlock_and_destroy before exit
-                self.diagnostics.unlock_flushed(flushed.is_ok());
-                if let Err(e) = flushed {
-                    eprintln!("clck: unlock flush failed: {e}");
-                }
-                self.diagnostics.authenticated_exit(id);
-                std::process::exit(0);
-            }
+            AuthOutcome::Unlocked => self.unlock_and_exit(UnlockSource::Password(id)),
             AuthOutcome::Wrong | AuthOutcome::MaxTries | AuthOutcome::Error => {
                 self.failed = true;
                 self.password.clear();
@@ -693,9 +822,18 @@ impl SessionLockHandler for Locker {
                 eprintln!("clck: daemon parent disappeared before lock readiness was reported");
             }
         }
+        // SESSION-2: the first fingerprint attempt starts only once the compositor confirmed THIS
+        // process holds the lock (and after `-f` readiness, so the child never holds that pipe).
+        if let Some(fingerprint) = self.fingerprint.as_mut() {
+            fingerprint.on_locked();
+            self.drive_fingerprint();
+        }
     }
 
     fn finished(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _lock: SessionLock) {
+        if let Some(fingerprint) = self.fingerprint.as_mut() {
+            fingerprint.kill_all();
+        }
         eprintln!("clck: lock finished/rejected");
         self.diagnostics.lock_finished();
         std::process::exit(1);
@@ -752,6 +890,14 @@ impl SeatHandler for Locker {
                 Err(e) => eprintln!("clck: get_keyboard failed: {e}"),
             }
         }
+        // Only the fingerprint path listens to the pointer; without it clck binds none, exactly
+        // as before (SESSION-2).
+        if cap == Capability::Pointer && self.pointer.is_none() && self.fingerprint.is_some() {
+            match self.seat_state.get_pointer(qh, &seat) {
+                Ok(pointer) => self.pointer = Some(pointer),
+                Err(e) => eprintln!("clck: get_pointer failed: {e}"),
+            }
+        }
     }
     fn remove_capability(
         &mut self,
@@ -764,6 +910,11 @@ impl SeatHandler for Locker {
             self.diagnostics.keyboard_capability(false);
             if let Some(kb) = self.keyboard.take() {
                 kb.release();
+            }
+        }
+        if cap == Capability::Pointer {
+            if let Some(pointer) = self.pointer.take() {
+                pointer.release();
             }
         }
     }
@@ -811,6 +962,9 @@ impl KeyboardHandler for Locker {
         _: u32,
         event: KeyEvent,
     ) {
+        // Any key re-arms the fingerprint reader (SESSION-2) -- before the early return below, and
+        // without looking at which key it was.
+        self.fingerprint_trigger(Trigger::Input);
         if self.verifying || self.backoff_active() {
             return; // one attempt in flight (AUTH-2), or cooling down after a wrong one
         }
@@ -869,6 +1023,29 @@ impl KeyboardHandler for Locker {
         if mods.caps_lock != self.caps_lock {
             self.caps_lock = mods.caps_lock;
             self.redraw_locks();
+        }
+    }
+}
+
+impl PointerHandler for Locker {
+    /// Bound only with the fingerprint path. Pointer input is never interpreted: motion, a button,
+    /// or a scroll only re-arms the reader. Enter/leave are the compositor placing the pointer
+    /// over a lock surface, not the user, so they arm nothing.
+    fn pointer_frame(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &WlPointer,
+        events: &[PointerEvent],
+    ) {
+        let user_input = events.iter().any(|event| {
+            !matches!(
+                event.kind,
+                PointerEventKind::Enter { .. } | PointerEventKind::Leave { .. }
+            )
+        });
+        if user_input {
+            self.fingerprint_trigger(Trigger::Input);
         }
     }
 }
@@ -956,6 +1133,7 @@ delegate_output!(Locker);
 delegate_shm!(Locker);
 delegate_seat!(Locker);
 delegate_keyboard!(Locker);
+delegate_pointer!(Locker);
 delegate_session_lock!(Locker);
 delegate_registry!(Locker);
 
@@ -1044,6 +1222,91 @@ mod tests {
             locked.contains("socket::spawn("),
             "the confirmed locked callback never starts the kiosk socket"
         );
+    }
+
+    fn production_source() -> &'static str {
+        include_str!("locker.rs")
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .expect("production source")
+    }
+
+    // LOCK-2 / SESSION-1 / SESSION-2: the compositor's unlock request is sent from exactly one
+    // function, and that function is reached from exactly two places: a password PAM success and a
+    // fingerprint PAM success.
+    #[test]
+    fn the_unlock_request_has_one_call_site_reached_only_by_pam_success() {
+        let production = production_source();
+        assert_eq!(production.matches("lock.unlock()").count(), 1);
+        let unlock_fn = production
+            .split("fn unlock_and_exit(")
+            .nth(1)
+            .expect("unlock_and_exit")
+            .split("\n    fn ")
+            .next()
+            .unwrap();
+        assert!(unlock_fn.contains("lock.unlock()"));
+
+        let callers: Vec<&str> = production
+            .match_indices("self.unlock_and_exit(")
+            .map(|(at, _)| {
+                let before = &production[..at];
+                let line_start = before.rfind('\n').map_or(0, |n| n + 1);
+                production[line_start..].lines().next().unwrap().trim()
+            })
+            .collect();
+        let mut callers = callers;
+        callers.sort_unstable();
+        assert_eq!(callers.len(), 2, "{callers:?}");
+        assert!(
+            callers[0].starts_with("AuthOutcome::Unlocked =>"),
+            "{callers:?}"
+        );
+        assert!(
+            callers[1].contains("UnlockSource::Fingerprint(generation)"),
+            "{callers:?}"
+        );
+
+        let drive = production
+            .split("fn drive_fingerprint(")
+            .nth(1)
+            .expect("drive_fingerprint")
+            .split("\n    fn ")
+            .next()
+            .unwrap();
+        assert!(drive.contains("if let Some(generation) = fingerprint.step("));
+    }
+
+    // SESSION-2: without a configured fingerprint service clck binds no pointer and never reaches
+    // the fingerprint path from any input.
+    #[test]
+    fn the_pointer_is_bound_only_for_the_fingerprint_path() {
+        let production = production_source();
+        assert_eq!(production.matches("get_pointer(").count(), 1);
+        let bind = production
+            .split("get_pointer(")
+            .next()
+            .unwrap()
+            .rsplit("if cap == Capability::Pointer")
+            .next()
+            .unwrap();
+        assert!(bind.contains("self.fingerprint.is_some()"));
+        for entry in [
+            "fn fingerprint_trigger(",
+            "fn fingerprint_tick(",
+            "fn drive_fingerprint(",
+        ] {
+            let body = production.split(entry).nth(1).expect(entry);
+            assert!(
+                body.trim_start()
+                    .split_once('{')
+                    .unwrap()
+                    .1
+                    .trim_start()
+                    .starts_with("let Some(fingerprint) = self.fingerprint.as_mut() else"),
+                "{entry} does not start by returning when the path is off"
+            );
+        }
     }
 
     // LOCK-3: this source-level guard complements checks/headless-output-hotplug.sh's real

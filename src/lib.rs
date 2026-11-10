@@ -20,6 +20,7 @@
 //!     username: None,
 //!     socket_path: None, // default: $XDG_RUNTIME_DIR/nixlock.sock
 //!     debug: false,
+//!     fingerprint_pam_service: None, // e.g. Some("clck-fingerprint".into())
 //! }).unwrap();
 //! ```
 //!
@@ -32,6 +33,7 @@ mod auth;
 mod content;
 mod daemon;
 mod diagnostics;
+mod fingerprint;
 mod locker;
 mod lockscreen;
 mod socket;
@@ -43,3 +45,9 @@ pub use lockscreen::ClockLockScreen;
 
 /// Verbose PAM auth check used by `clck --check-auth` (verify your PAM service works).
 pub use auth::diagnose as check_auth;
+
+/// Run clck's hidden fingerprint child (`SESSION-2`) if this process was started as one, and
+/// return otherwise. A binary embedding clck calls it first in `main`; [`run`], [`run_daemonized`]
+/// and [`Builder::run`] call it too.
+#[doc(hidden)]
+pub use fingerprint::run_child_if_requested as fingerprint_child_if_requested;

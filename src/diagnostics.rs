@@ -7,6 +7,7 @@
 
 use crate::auth::{AuthOutcome, AuthStage};
 use crate::content::OutputRole;
+use crate::fingerprint::{ChildExit, Disarmed, Trigger, Verdict};
 use pam_client::ErrorCode;
 use std::fmt::Arguments;
 use std::time::Duration;
@@ -192,6 +193,67 @@ impl Diagnostics {
 
     pub(crate) fn sigusr1(&self) {
         self.emit(format_args!("event=sigusr1 action=repaint"));
+    }
+
+    // The fingerprint path (SESSION-2). Generations, symbolic outcomes, and reasons only: no
+    // fingerprint data ever passes through this process, and PAM message text is never recorded.
+
+    pub(crate) fn fingerprint_trigger(&self, trigger: Trigger) {
+        self.emit(format_args!(
+            "event=fingerprint_armed trigger={}",
+            trigger.label()
+        ));
+    }
+
+    pub(crate) fn fingerprint_spawned(&self, generation: u64) {
+        self.emit(format_args!(
+            "event=fingerprint_started generation={generation}"
+        ));
+    }
+
+    pub(crate) fn fingerprint_spawn_failed(&self, generation: u64) {
+        self.emit(format_args!(
+            "event=fingerprint_spawn_failed generation={generation}"
+        ));
+    }
+
+    pub(crate) fn fingerprint_pidfd_unavailable(&self, generation: u64) {
+        self.emit(format_args!(
+            "event=fingerprint_pidfd_unavailable generation={generation} fallback=tick"
+        ));
+    }
+
+    pub(crate) fn fingerprint_finished(&self, generation: u64, exit: ChildExit, verdict: Verdict) {
+        self.emit(format_args!(
+            "event=fingerprint_finished generation={generation} exit={} verdict={}",
+            exit.label(),
+            verdict.label()
+        ));
+    }
+
+    pub(crate) fn fingerprint_killed(&self, generation: u64, reason: &'static str) {
+        self.emit(format_args!(
+            "event=fingerprint_killed generation={generation} reason={reason}"
+        ));
+    }
+
+    pub(crate) fn fingerprint_disarmed(&self, reason: Disarmed) {
+        self.emit(format_args!(
+            "event=fingerprint_disarmed reason={}",
+            reason.label()
+        ));
+    }
+
+    pub(crate) fn fingerprint_unlock_requested(&self, generation: u64) {
+        self.emit(format_args!(
+            "event=unlock_requested source=fingerprint generation={generation}"
+        ));
+    }
+
+    pub(crate) fn fingerprint_exit(&self, generation: u64) {
+        self.emit(format_args!(
+            "event=process_exit reason=fingerprint generation={generation}"
+        ));
     }
 }
 

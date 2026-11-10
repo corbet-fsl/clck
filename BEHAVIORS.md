@@ -36,8 +36,10 @@ fail-secure role precisely so a bug in the locker cannot open the screen -- a lo
 program whose *crash* must be safe. This is only true if nixlock never takes an action that would let
 its own death unlock the screen.
 
-Not: nixlock sends the compositor's unlock request on exactly one path -- a verified password
-(`SESSION-1`) -- and on no other: not a signal, not a timeout, not exit, not a panic handler.
+Not: nixlock sends the compositor's unlock request on exactly one path -- a PAM success from the
+password service, or (when configured) from the fingerprint service (`SESSION-1`, `SESSION-2`) --
+and on no other: not a signal, not a timeout, not exit, not a panic handler, not a fingerprint
+child that merely ended.
 
 ### LOCK-3 — every output advertised while locked receives a lock surface
 **GIVEN** the compositor confirms the session lock while no outputs exist, or an output is added,
@@ -165,25 +167,57 @@ Not: nixlock never guesses a service name and never substitutes a default PAM st
 told to use.
 
 ## Session — the one gate
-### SESSION-1 — only a correct PAM password unlocks; a wrong one stays locked
+### SESSION-1 — only PAM success unlocks: the password service, or (when configured) the fingerprint service
 **GIVEN** a password submitted on a Session output, **THEN** the session unlocks if and only if PAM
-returns success; a wrong password leaves the session locked, advances a visible failed-attempt
-indicator, and re-arms for the next attempt.
+returns success for the password service; a wrong password leaves the session locked, advances a
+visible failed-attempt indicator, and re-arms for the next attempt. The only other way in is a PAM
+success from the configured fingerprint service (`SESSION-2`).
 
 Why: this is the single gate, and the compositor unlock request is emitted on exactly one condition --
-PAM success -- and nothing adjacent to it: not a keypress count, not an elapsed time, not a received
-signal. Every other input path has to be provably incapable of unlocking.
+PAM success, from the password service or (when configured) the fingerprint service -- and nothing
+adjacent to it: not a keypress count, not an elapsed time, not a received signal. Every other input
+path has to be provably incapable of unlocking.
 
 Not: no lockout that bricks the session -- a wrong password is always retryable -- and `SIGUSR1`
 re-shows the indicator (`COMPAT-1`) without touching auth state. Its handler stores one flag and
 returns; asserted against the handler's own source, so giving it auth state fails the build.
+
+### SESSION-2 — the fingerprint is an optional PARALLEL path that can only add a PAM-gated way in
+**GIVEN** `fingerprint_pam_service` is unset (the default), **THEN** nixlock behaves exactly as without
+this entry: no child process, no pointer binding, no extra output. **GIVEN** it names a plain
+lowercase service that exists in `/etc/pam.d` and differs from `pam_service`, **THEN** while locked
+nixlock keeps at most one fingerprint attempt running: armed when the compositor confirms the lock,
+again by key or pointer input when none is running, and by a display coming back (an output that
+appears after the lock, a resume from suspend). Each attempt is a separate PAM transaction (auth
+only) in a child process -- a re-exec of the locker with an empty environment, only stdio, and a
+parent-death signal -- whose conversation answers no prompt. The session unlocks through the same
+single unlock call as a correct password if and only if the child of the attempt IN FLIGHT exits 0
+AND wrote the exact success marker; the result of any other attempt (killed at its 40 s deadline,
+superseded, or reported twice) is ignored. The password field works throughout, and the lock screen
+shows nothing new: no prompt, no fingerprint text, no failure indicator.
+
+Why: a finger is convenience, not policy. Stacked into the password service it would be sequential
+-- the password field dead until the reader times out, and a missing or broken reader a lockout.
+In parallel, a reader that is absent, unenrolled, busy, or slow costs nothing. A child process,
+unlike a thread, can be killed while `pam_fprintd` blocks, and keeps the module's code out of the
+process that holds the lock and the password buffer (`LOCK-2`). Arming only at lock, input and wake
+keeps the reader idle through a long locked night.
+
+Not: never a second factor and never a replacement for the password; never sudo, login, polkit or
+the keyring (nixlock uses only its own dedicated service). Not retried without limit: five rejected
+fingers, or three attempts in a row that end at once (no reader, no fprintd, no enrolled print),
+turn the path off until the next lock. Never an unlock on a child's exit status alone, a signal, a
+timeout, or a missing service: a missing, malformed, or shared service leaves nixlock password-only
+and is never replaced by PAM's `other` (`AUTH-3`). `pkill -USR1` aimed at the locker does not
+cancel an attempt.
 
 ## Diagnostics — enough evidence without credential material
 ### DIAG-1 — debug mode identifies the failing stage and never logs the credential
 **GIVEN** debug mode is enabled and an unlock is attempted, **THEN** journald receives structured
 events for submission, PAM start/finish, delivery to the Wayland event loop, UI failure/backoff or
 the compositor unlock request, and process exit. Attempts are correlated by an opaque counter and
-PAM failures include only their stage, symbolic result code, and duration.
+PAM failures include only their stage, symbolic result code, and duration. Fingerprint attempts
+(`SESSION-2`) are reported by generation, trigger, and symbolic outcome only.
 
 Why: a cleared password field looks the same for a wrong password, an unavailable PAM service, a
 stalled event loop, and a failed Wayland flush. Those cases need separate evidence, including an
@@ -207,8 +241,8 @@ the fleet's swayidle line ends `unlock 'pkill -USR1 nixlock'`. With no handler i
 killed the locker, and by `LOCK-2` the compositor then holds every output locked with no client left
 to take a password -- the "lockout that bricks the session" `SESSION-1` forbids, reachable by the one
 signal the desk is actually wired to send.
-Per-host values it cannot receive on that command line -- kiosk outputs, kiosk command, PAM service --
-come from `$XDG_CONFIG_HOME/nixlock/config.json`, because swayidle only ever appends `-f`.
+Per-host values it cannot receive on that command line -- kiosk outputs, kiosk command, PAM service,
+fingerprint PAM service -- come from `$XDG_CONFIG_HOME/nixlock/config.json`, because swayidle only ever appends `-f`.
 
 Why: the fleet's idle daemon treats the locker as a black box it calls `<cmd> -f` and signals by
 process name. Being a faithful drop-in for that contract is what lets nixlock replace swaylock with
@@ -228,4 +262,5 @@ and the binary's name is part of the contract, not a cosmetic detail.
   locked*.
 - **Not an output/display-layout manager.** nixlock reads connector names; it does not arrange, scale,
   or toggle outputs.
-- **Not multi-factor.** A screen lock here is a deliberate low-friction single-factor gate.
+- **Not multi-factor.** A screen lock here is a deliberate low-friction single-factor gate. The
+  optional fingerprint (`SESSION-2`) is an alternative to the password, never an additional one.

@@ -16,9 +16,14 @@ struct FileCfg {
     socket_path: Option<String>,
     #[serde(default)]
     debug: bool,
+    #[serde(default)]
+    fingerprint_pam_service: Option<String>,
 }
 
 fn main() {
+    // First, before any argument parsing: a hidden fingerprint child (SESSION-2) never returns
+    // from here, so it cannot fall through into the locker or the help text.
+    clck::fingerprint_child_if_requested();
     if std::env::args().any(|a| a == "--check-auth") {
         return check_auth_mode();
     }
@@ -99,6 +104,7 @@ fn load_config() -> Config {
         username: None,
         socket_path: file.socket_path.map(std::path::PathBuf::from),
         debug: file.debug,
+        fingerprint_pam_service: file.fingerprint_pam_service,
     }
 }
 
@@ -113,7 +119,10 @@ fn help() {
            -v, --version     print version\n\
          \n\
          CONFIG: $XDG_CONFIG_HOME/clck/config.json\n\
-           {{ kiosk_outputs: [..], pam_service: \"..\", socket_path: \"..\", debug: false }}\n\
+           {{ kiosk_outputs: [..], pam_service: \"..\", socket_path: \"..\", debug: false,\n\
+             fingerprint_pam_service: null }}\n\
+           fingerprint_pam_service (optional): a PAM service such as one\n\
+           `auth required pam_fprintd.so` line, tried in parallel with the password.\n\
          \n\
          The default binary shows the clock lock screen on every `Session` output. A `Kiosk`\n\
          output shows whatever a client streams over the kiosk display Unix socket (DISPLAY-1) --\n\
@@ -126,6 +135,37 @@ fn help() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // SESSION-2: a config without the key keeps every host exactly as before.
+    #[test]
+    fn the_fingerprint_path_is_off_unless_configured() {
+        let default: FileCfg = serde_json::from_str(r#"{"pam_service":"swaylock"}"#).unwrap();
+        let set: FileCfg =
+            serde_json::from_str(r#"{"fingerprint_pam_service":"clck-fingerprint"}"#).unwrap();
+
+        assert_eq!(default.fingerprint_pam_service, None);
+        assert_eq!(
+            set.fingerprint_pam_service.as_deref(),
+            Some("clck-fingerprint")
+        );
+    }
+
+    #[test]
+    fn the_hidden_child_is_dispatched_before_any_other_argument() {
+        let main = include_str!("clck.rs")
+            .split("fn main()")
+            .nth(1)
+            .expect("main");
+        let child = main
+            .find("fingerprint_child_if_requested()")
+            .expect("dispatch");
+        for later in ["--check-auth", "--help", "--version", "load_config()"] {
+            assert!(
+                child < main.find(later).expect(later),
+                "{later} is parsed first"
+            );
+        }
+    }
 
     #[test]
     fn debug_mode_is_off_by_default_and_explicit_when_enabled() {
