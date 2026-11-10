@@ -31,9 +31,11 @@
 
 mod auth;
 mod content;
+pub mod control;
 mod daemon;
 mod diagnostics;
 mod fingerprint;
+pub mod kioskd;
 mod locker;
 mod lockscreen;
 mod socket;

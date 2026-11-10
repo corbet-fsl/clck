@@ -18,6 +18,12 @@ struct FileCfg {
     debug: bool,
     #[serde(default)]
     fingerprint_pam_service: Option<String>,
+    /// `clck kioskd` / `clck kiosk` only (the lock-less kiosk): where the control command connects.
+    #[serde(default)]
+    control_socket_path: Option<String>,
+    /// `clck kioskd` only: where a frame client streams (never the locker's `socket_path`).
+    #[serde(default)]
+    live_socket_path: Option<String>,
 }
 
 fn main() {
@@ -26,6 +32,14 @@ fn main() {
     clck::fingerprint_child_if_requested();
     if std::env::args().any(|a| a == "--check-auth") {
         return check_auth_mode();
+    }
+    // The lock-less kiosk: `clck kioskd` (the daemon) and `clck kiosk on|off|status` (its one dumb command). Dispatched
+    // before the locker's argument loop, which ignores unknown words and would otherwise start a LOCK.
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    match argv.first().map(String::as_str) {
+        Some("kioskd") => return kioskd_mode(),
+        Some("kiosk") => return kiosk_mode(&argv[1..]),
+        _ => {}
     }
     let mut daemonize = false;
     let mut debug = false;
@@ -48,6 +62,64 @@ fn main() {
     if let Err(e) = result {
         eprintln!("clck: fatal: {e}");
         std::process::exit(1);
+    }
+}
+
+fn read_file_cfg() -> FileCfg {
+    std::fs::read_to_string(config_path())
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+/// `clck kioskd`: the kiosk without a lock (src/kioskd.rs). Runs until killed.
+fn kioskd_mode() {
+    let file = read_file_cfg();
+    let config = clck::kioskd::Config {
+        kiosk_outputs: file.kiosk_outputs,
+        control_socket: file.control_socket_path.map(std::path::PathBuf::from),
+        live_socket: file.live_socket_path.map(std::path::PathBuf::from),
+        locker_socket: file.socket_path.map(std::path::PathBuf::from),
+    };
+    if let Err(e) = clck::kioskd::run(config) {
+        eprintln!("clck kioskd: fatal: {e}");
+        std::process::exit(1);
+    }
+}
+
+/// `clck kiosk on|off|status`: the one dumb command (src/control.rs). Exit 0 when the daemon answered ok.
+fn kiosk_mode(args: &[String]) {
+    use clck::control::{default_path, send, Command};
+    let cmd = match args {
+        [a] if a == "on" => Command::Kiosk(true),
+        [a] if a == "off" => Command::Kiosk(false),
+        [a] if a == "status" => Command::Status,
+        _ => {
+            eprintln!("usage: clck kiosk on|off|status");
+            std::process::exit(2);
+        }
+    };
+    let file = read_file_cfg();
+    let Some(path) = file
+        .control_socket_path
+        .map(std::path::PathBuf::from)
+        .or_else(default_path)
+    else {
+        eprintln!("clck: no control socket path (set control_socket_path or XDG_RUNTIME_DIR)");
+        std::process::exit(2);
+    };
+    match send(&path, cmd, std::time::Duration::from_secs(3)) {
+        Ok(reply) if reply.ok => {
+            println!("{}", reply.line().trim_end());
+        }
+        Ok(reply) => {
+            eprintln!("clck: {}", reply.error.unwrap_or_else(|| "refused".into()));
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("clck: no kioskd answered on {}: {e}", path.display());
+            std::process::exit(1);
+        }
     }
 }
 

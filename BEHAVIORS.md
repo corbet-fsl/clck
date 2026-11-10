@@ -128,6 +128,44 @@ Not: merely requesting an `ext-session-lock` is not ownership. nixlock resolves 
 socket path during startup but does not unlink or bind it until the compositor emits the confirmed
 `locked` event. A rejected process exits through `finished` without publishing a socket.
 
+## Kiosk without a lock — `clck kioskd`, a display that is never a second locker
+### KIOSKD-1 — the lock-less kiosk shares nothing with the lock path
+**GIVEN** `clck kioskd` running and any command on its control socket, **THEN** nothing it receives can reach password
+verification, the fingerprint path, the session lock or the compositor's unlock call: the daemon holds no session lock, binds
+no seat (no keyboard, no pointer), and its source (`src/kioskd.rs`, `src/control.rs`) names none of them (a test reads both
+files). `kiosk off` removes an overlay and nothing else; it never unlocks. `kiosk on` never locks. While the session is locked
+the compositor shows only the lock surfaces, so the overlay is simply not visible then.
+
+Why: Julian's desk wants the status boards on one monitor whenever the seat is not in use, without locking the seat. That must
+not become a second, weaker way to unlock (or to lock) the session. Separate process, separate code path, no shared state.
+
+Not: the daemon never decides WHEN to show the kiosk: no presence logic, no timer policy. A sensor or the human sends the
+command.
+
+### KIOSKD-2 — only named kiosk outputs, input-inert, over the desktop but pushing nothing aside
+**GIVEN** `kiosk on`, **THEN** a surface exists exactly on each output whose name equals a configured `kiosk_outputs` entry
+(the locker's exact-name rule, `role_for`), on the overlay layer, anchored to all edges, exclusive zone -1, keyboard
+interactivity none, with an empty input region (pointer events pass through to what is below). With no kiosk output configured
+`kiosk on` is refused.
+
+### KIOSKD-3 — a dumb, bounded, private control socket
+**GIVEN** the control socket (`$XDG_RUNTIME_DIR/clck-control.sock`, mode 0600), **THEN** it accepts one JSON line per
+connection: `{"cmd":"kiosk","on":true|false}` or `{"cmd":"status"}`, at most 256 bytes, read within 250 ms; everything else (an
+unknown command, an unknown field, a missing `on`, invalid JSON, an oversized line) is answered with an error and changes
+nothing. A live socket of another daemon is never taken over, a stale one is replaced, a file that is not a socket is never
+removed.
+
+### KIOSKD-4 — its own frame socket, never the locker's
+**GIVEN** a frame client (e.g. cksk), **THEN** it streams to the daemon's OWN live socket (`live_socket_path`, default
+`$XDG_RUNTIME_DIR/clck-live.sock`) over the same content-blind wire as `DISPLAY-1`/`DISPLAY-2`; the daemon refuses to start
+when that path is the locker's `socket_path`, so `DISPLAY-3` (only the accepted locker publishes ITS socket) is untouched. The
+latest valid frame is painted while the kiosk is on, else the built-in clock.
+
+### KIOSKD-5 — the locker's command line is unchanged
+**GIVEN** `clck` with any arguments other than a FIRST argument `kioskd` or `kiosk`, **THEN** it behaves exactly as before
+(unknown words ignored, `-f`, `--check-auth`). `kioskd` and `kiosk` are dispatched before the locker's argument loop and never
+reach it.
+
 ## Authentication — the credential and the conversation
 ### AUTH-1 — the password lives only in a zeroizing buffer
 **GIVEN** a user typing a password, **THEN** the bytes land in a buffer that is zeroized on drop, are
@@ -269,7 +307,8 @@ and the binary's name is part of the contract, not a cosmetic detail.
 - **Not an idle daemon.** swayidle/hypridle own idle timeouts, suspend, and before-sleep locking;
   nixlock is only ever invoked by them.
 - **Not a bar or status surface** for the unlocked desktop. The kiosk role is a display *while
-  locked*.
+  locked*. The one exception is `clck kioskd` (`KIOSKD-*`): a separate, deliberately dumb process that
+  shows the same kiosk content on the kiosk outputs on command, without a lock.
 - **Not an output/display-layout manager.** nixlock reads connector names; it does not arrange, scale,
   or toggle outputs.
 - **Not multi-factor.** A screen lock here is a deliberate low-friction single-factor gate. The
