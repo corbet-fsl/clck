@@ -184,8 +184,9 @@ returns; asserted against the handler's own source, so giving it auth state fail
 
 ### SESSION-2 — the fingerprint is an optional PARALLEL path that can only add a PAM-gated way in
 **GIVEN** `fingerprint_pam_service` is unset (the default), **THEN** nixlock behaves exactly as without
-this entry: no child process, no pointer binding, no extra output. **GIVEN** it names a plain
-lowercase service that exists in `/etc/pam.d` and differs from `pam_service`, **THEN** while locked
+this entry: no child process, no pointer binding, no extra output. **GIVEN** it names a DEDICATED
+service -- `clck-<lowercase>`, a root-owned file in `/etc/pam.d` that nobody else can write, that the
+locker can read, with an `auth` line, and not `pam_service` -- **THEN** while locked
 nixlock keeps at most one fingerprint attempt running: armed when the compositor confirms the lock,
 again by key or pointer input when none is running, and by a display coming back (an output that
 appears after the lock, a resume from suspend). Each attempt is a separate PAM transaction (auth
@@ -204,12 +205,21 @@ process that holds the lock and the password buffer (`LOCK-2`). Arming only at l
 keeps the reader idle through a long locked night.
 
 Not: never a second factor and never a replacement for the password; never sudo, login, polkit or
-the keyring (nixlock uses only its own dedicated service). Not retried without limit: five rejected
-fingers, or three attempts in a row that end at once (no reader, no fprintd, no enrolled print),
-turn the path off until the next lock. Never an unlock on a child's exit status alone, a signal, a
-timeout, or a missing service: a missing, malformed, or shared service leaves nixlock password-only
-and is never replaced by PAM's `other` (`AUTH-3`). `pkill -USR1` aimed at the locker does not
-cancel an attempt.
+the keyring (nixlock uses only its own dedicated service). Never a stock service: the name comes
+from the user's own config file, and whatever the service's stack accepts WITHOUT a prompt unlocks
+the moment the lock is taken -- so only a `clck-` service the host created for this may be named,
+and it should hold the fingerprint module alone (`auth required pam_fprintd.so max-tries=1
+timeout=30`; `max-tries=1` makes one rejected finger one attempt, and the timeout must stay under the
+locker's 40 s deadline). Not retried without limit: five rejected fingers, three attempts in a row
+that end at once (no reader, no fprintd, no enrolled print, fprintd refusing the verify), or three
+attempts killed at the deadline turn the path off until the next lock; an attempt that simply timed
+out (nobody touched the reader) re-arms only on new input. Never an unlock on a child's exit status
+alone, a signal, a timeout, or a missing service: a missing, malformed, unreadable, or stock service
+leaves nixlock password-only and is never replaced by PAM's `other` (`AUTH-3`). `pkill -USR1` aimed
+at the locker does not cancel an attempt. Not stronger than the reader: a match-on-chip sensor on
+Linux has no host-verified secure channel, and someone with physical access to the machine can
+attack the sensor itself; the finger is convenience for a lock screen, never a gate for anything
+more sensitive.
 
 ## Diagnostics — enough evidence without credential material
 ### DIAG-1 — debug mode identifies the failing stage and never logs the credential

@@ -43,6 +43,11 @@ pub(crate) const MARKER: &[u8] = b"clck-fingerprint-verified\n";
 /// Where PAM reads its per-service policy. A configured fingerprint service must be a file here;
 /// see [`service_problem`].
 pub(crate) const PAM_DIR: &str = "/etc/pam.d";
+/// Every fingerprint service name starts with this. The name comes from the user's own config
+/// file, so it may only ever select a service the host made FOR this purpose -- never a stock one
+/// such as `system-services` (`auth sufficient pam_permit.so` on Arch) or `system-auth` (which
+/// would count every silent attempt as a failed login in pam_faillock).
+pub(crate) const SERVICE_PREFIX: &str = "clck-";
 
 // Child exit statuses. Only `EXIT_VERIFIED` together with `MARKER` can unlock.
 pub(crate) const EXIT_VERIFIED: i32 = 0;
@@ -68,6 +73,9 @@ pub(crate) const MAX_NO_MATCH: u32 = 5;
 /// stays off for this lock instead of spawning a process on every key press.
 pub(crate) const MAX_QUICK_FAILURES: u32 = 3;
 pub(crate) const QUICK: Duration = Duration::from_secs(5);
+/// Attempts killed at [`ATTEMPT_DEADLINE`] (fprintd or the reader stopped answering). After this
+/// many in one lock the path stays off instead of holding a hung reader again on every key press.
+pub(crate) const MAX_HUNG: u32 = 3;
 /// A jump of CLOCK_BOOTTIME against CLOCK_MONOTONIC larger than this between two 1 s ticks means
 /// the machine was suspended in between.
 pub(crate) const RESUME_JUMP: Duration = Duration::from_secs(2);
@@ -98,11 +106,13 @@ impl Trigger {
 pub(crate) enum ChildExit {
     /// Exit status 0 and exactly [`MARKER`] on stdout: PAM accepted the finger.
     Verified,
-    /// A finger was read and rejected (PAM_AUTH_ERR / PAM_MAXTRIES).
+    /// A finger was read and rejected: PAM_MAXTRIES, which `pam_fprintd max-tries=1` returns for
+    /// one finger that does not match.
     NoMatch,
     /// No reader, no fprintd, no enrolled print, the reader busy, or pam_fprintd's own timeout.
     Unavailable,
-    /// Everything else: a PAM or setup error, a signal, status 0 without the exact marker.
+    /// Everything else: a PAM or setup error (PAM_AUTH_ERR included: pam_fprintd returns it when
+    /// fprintd refuses to start a verify), a signal, status 0 without the exact marker.
     Failed,
 }
 
@@ -150,6 +160,7 @@ impl Verdict {
 pub(crate) enum Disarmed {
     NoMatchLimit,
     Unavailable,
+    Hung,
 }
 
 impl Disarmed {
@@ -157,6 +168,7 @@ impl Disarmed {
         match self {
             Self::NoMatchLimit => "no_match_limit",
             Self::Unavailable => "unavailable",
+            Self::Hung => "unresponsive",
         }
     }
 }
@@ -181,6 +193,7 @@ pub(crate) struct Arm {
     not_before: Option<Instant>,
     no_match: u32,
     quick_failures: u32,
+    hung: u32,
     disarmed: Option<Disarmed>,
 }
 
@@ -210,6 +223,12 @@ impl Arm {
             if now >= flight.deadline || self.disarmed.is_some() {
                 self.in_flight = None;
                 self.not_before = Some(now + SETTLE);
+                if now >= flight.deadline {
+                    self.hung += 1;
+                    if self.hung >= MAX_HUNG && self.disarmed.is_none() {
+                        self.disarmed = Some(Disarmed::Hung);
+                    }
+                }
                 return Action::Kill(flight.generation);
             }
             return Action::None;
@@ -275,31 +294,68 @@ impl Arm {
 /// Why a configured fingerprint service is refused, or `None` when it may be used. A refused
 /// service leaves the locker password-only; it never falls back to another service (`AUTH-3`).
 ///
-/// The name must be a plain lowercase PAM service name (Linux-PAM lowercases the name before it
-/// opens `/etc/pam.d/<name>`, so only a lowercase name makes the file checked here the file PAM
-/// reads). The file must exist: Linux-PAM silently uses `/etc/pam.d/other` for a missing service,
-/// and the fingerprint conversation is not allowed to depend on what `other` happens to say.
+/// Whatever the service's `auth` stack returns as success WITHOUT a prompt unlocks the moment the
+/// lock is taken (the first attempt starts then, and the conversation answers no prompt). So the
+/// service must be one the host made for exactly this:
+/// - a dedicated name: [`SERVICE_PREFIX`] plus lowercase ASCII (Linux-PAM lowercases the name before
+///   it opens `/etc/pam.d/<name>`, so only a lowercase name makes the file checked here the file PAM
+///   reads), and not the password service;
+/// - a file in `/etc/pam.d` that this process can open (Linux-PAM silently uses `/etc/pam.d/other`
+///   for a missing or unreadable service), owned by `owner` (root), writable by nobody else, and
+///   with at least one `auth` line (otherwise PAM takes `other`'s auth stack).
+///
+/// `owner` is a parameter only so tests can use files they own.
 pub(crate) fn service_problem(
     service: &str,
     password_service: Option<&str>,
     pam_dir: &Path,
+    owner: u32,
 ) -> Option<&'static str> {
-    if service.is_empty() {
-        return Some("empty_name");
-    }
-    if service == "."
-        || service == ".."
-        || !service
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let Some(rest) = service.strip_prefix(SERVICE_PREFIX) else {
+        return Some("not_dedicated");
+    };
+    if rest.is_empty()
+        || !rest
             .bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"-_.".contains(&b))
     {
         return Some("invalid_name");
     }
-    if password_service == Some(service) {
+    if password_service.is_some_and(|password| password.to_ascii_lowercase() == service) {
         return Some("same_as_password_service");
     }
-    if !pam_dir.join(service).is_file() {
+    let mut file = match std::fs::File::open(pam_dir.join(service)) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Some("missing"),
+        Err(_) => return Some("unreadable"),
+    };
+    // fstat of the descriptor just opened: the checks below are about exactly the bytes PAM reads.
+    let Ok(meta) = file.metadata() else {
+        return Some("unreadable");
+    };
+    if !meta.is_file() {
         return Some("missing");
+    }
+    if meta.uid() != owner {
+        return Some("not_root_owned");
+    }
+    if meta.permissions().mode() & 0o022 != 0 {
+        return Some("writable_by_others");
+    }
+    let mut text = String::new();
+    if (&mut file)
+        .take(64 * 1024)
+        .read_to_string(&mut text)
+        .is_err()
+    {
+        return Some("unreadable");
+    }
+    let has_auth = text
+        .lines()
+        .any(|line| matches!(line.split_whitespace().next(), Some("auth") | Some("-auth")));
+    if !has_auth {
+        return Some("no_auth_line");
     }
     None
 }
@@ -400,7 +456,7 @@ pub(crate) fn classify(status: ExitStatus, stdout: &[u8]) -> ChildExit {
 pub(crate) fn exit_code_for(code: pam_client::ErrorCode) -> i32 {
     use pam_client::ErrorCode;
     match code {
-        ErrorCode::AUTH_ERR | ErrorCode::MAXTRIES => EXIT_NO_MATCH,
+        ErrorCode::MAXTRIES => EXIT_NO_MATCH,
         ErrorCode::AUTHINFO_UNAVAIL
         | ErrorCode::USER_UNKNOWN
         | ErrorCode::CRED_INSUFFICIENT
@@ -551,6 +607,9 @@ impl FingerprintPath {
                         let _ = running.child.kill();
                         diagnostics.fingerprint_killed(generation, "deadline");
                         self.reaping.push(running.child);
+                        if let Some(reason) = self.arm.disarmed() {
+                            diagnostics.fingerprint_disarmed(reason);
+                        }
                     } else {
                         self.running = Some(running);
                     }
@@ -645,6 +704,9 @@ fn child_exit(code: i32, debug: bool, stage: &str) -> ! {
 
 /// The child: one PAM transaction against the fingerprint service, then exit. Never returns.
 fn child_main(args: &[OsString]) -> ! {
+    // Exec'd through /proc/self/exe the kernel names this process `exe`; name it for ps/journald.
+    // SAFETY: PR_SET_NAME reads a NUL-terminated string of at most 16 bytes.
+    unsafe { libc::prctl(libc::PR_SET_NAME, c"clck-fp".as_ptr(), 0, 0, 0) };
     // Die with the locker. Set first; the parent pid check below closes the window in which the
     // parent could have died before this line.
     // SAFETY: prctl(PR_SET_PDEATHSIG) only sets this process's parent-death signal.
@@ -669,7 +731,7 @@ fn child_main(args: &[OsString]) -> ! {
     if parent.parse::<libc::pid_t>().ok() != Some(unsafe { libc::getppid() }) {
         child_exit(EXIT_SETUP, debug, "parent");
     }
-    if service_problem(service, None, Path::new(PAM_DIR)).is_some() {
+    if service_problem(service, None, Path::new(PAM_DIR), 0).is_some() {
         child_exit(EXIT_SETUP, debug, "service");
     }
 
@@ -700,6 +762,18 @@ fn child_main(args: &[OsString]) -> ! {
 mod tests {
     use super::*;
     use std::os::unix::process::ExitStatusExt;
+    use std::sync::{Mutex, MutexGuard};
+
+    /// Tests that write an executable or start a process hold this. Without it, a fork in another
+    /// test thread can inherit a script's still-open write descriptor and the exec of that script
+    /// fails with ETXTBSY (seen as intermittent spawn failures under parallel `cargo test`).
+    static SPAWN: Mutex<()> = Mutex::new(());
+
+    fn serial() -> MutexGuard<'static, ()> {
+        SPAWN
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     fn locked_arm() -> (Arm, Instant) {
         let mut arm = Arm::default();
@@ -855,19 +929,40 @@ mod tests {
     fn generations_are_never_reused() {
         let (mut arm, mut now) = locked_arm();
         let mut seen = Vec::new();
-        for _ in 0..4 {
+        for round in 0..4 {
             arm.trigger(Trigger::Wake);
             match arm.poll(now) {
                 Action::Spawn(generation) => {
                     seen.push(generation);
-                    now += ATTEMPT_DEADLINE;
-                    assert_eq!(arm.poll(now), Action::Kill(generation));
+                    if round % 2 == 0 {
+                        now += ATTEMPT_DEADLINE;
+                        assert_eq!(arm.poll(now), Action::Kill(generation));
+                    } else {
+                        now += Duration::from_secs(30);
+                        arm.finished(generation, ChildExit::Unavailable, now);
+                    }
                     now += SETTLE;
                 }
                 other => panic!("expected a spawn, got {other:?}"),
             }
         }
         assert_eq!(seen, vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn attempts_that_hang_until_the_deadline_disarm_the_path_after_three() {
+        let (mut arm, mut now) = locked_arm();
+        for generation in 1..=MAX_HUNG as u64 {
+            arm.trigger(Trigger::Input);
+            assert_eq!(arm.poll(now), Action::Spawn(generation));
+            now += ATTEMPT_DEADLINE;
+            assert_eq!(arm.poll(now), Action::Kill(generation));
+            now += SETTLE;
+        }
+        assert_eq!(arm.disarmed(), Some(Disarmed::Hung));
+        arm.trigger(Trigger::Input);
+        arm.trigger(Trigger::Wake);
+        assert_eq!(arm.poll(now + Duration::from_secs(600)), Action::None);
     }
 
     #[test]
@@ -904,8 +999,10 @@ mod tests {
     #[test]
     fn pam_errors_map_to_non_success_statuses() {
         use pam_client::ErrorCode;
-        assert_eq!(exit_code_for(ErrorCode::AUTH_ERR), EXIT_NO_MATCH);
+        // pam_fprintd max-tries=1: one finger that does not match.
         assert_eq!(exit_code_for(ErrorCode::MAXTRIES), EXIT_NO_MATCH);
+        // pam_fprintd: fprintd refused to start the verify (polkit, reader in use) -- not a finger.
+        assert_eq!(exit_code_for(ErrorCode::AUTH_ERR), EXIT_PAM_ERROR);
         // pam_fprintd: timeout, no fprintd, no reader, no enrolled print, claim refused.
         assert_eq!(exit_code_for(ErrorCode::AUTHINFO_UNAVAIL), EXIT_UNAVAILABLE);
         assert_eq!(exit_code_for(ErrorCode::USER_UNKNOWN), EXIT_UNAVAILABLE);
@@ -934,35 +1031,93 @@ mod tests {
     }
 
     #[test]
-    fn a_service_must_be_a_plain_existing_name_and_not_the_password_service() {
+    fn only_a_dedicated_root_style_service_with_an_auth_line_is_accepted() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
         let dir = std::env::temp_dir().join(format!("clck-fp-pamd-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            dir.join("clck-fingerprint"),
-            "auth required pam_fprintd.so\n",
-        )
-        .unwrap();
-        std::fs::create_dir_all(dir.join("a-directory")).unwrap();
+        let write = |name: &str, text: &str, mode: u32| {
+            let path = dir.join(name);
+            std::fs::write(&path, text).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+        };
+        let good = "# comment\nauth required pam_fprintd.so max-tries=1 timeout=30\n";
+        write("clck-fingerprint", good, 0o644);
+        write("clck-dash-auth", "-auth required pam_fprintd.so\n", 0o644);
+        write(
+            "clck-no-auth",
+            "# auth only in a comment\naccount required pam_permit.so\n",
+            0o644,
+        );
+        write("clck-group-writable", good, 0o664);
+        write("clck-other-writable", good, 0o646);
+        write("clck-unreadable", good, 0o000);
+        // Stock services exist under their own names; the name rule alone keeps them out.
+        write("system-services", "auth sufficient pam_permit.so\n", 0o644);
+        write("other", "auth required pam_deny.so\n", 0o644);
+        std::fs::create_dir_all(dir.join("clck-a-directory")).unwrap();
+        symlink(dir.join("clck-fingerprint"), dir.join("clck-link")).unwrap();
 
-        let check = |name: &str, password: Option<&str>| service_problem(name, password, &dir);
+        // `owner` is this test's own uid: the files are ours, as /etc/pam.d's are root's.
+        // SAFETY: getuid has no preconditions.
+        let me = unsafe { libc::getuid() };
+        let check = |name: &str, password: Option<&str>| service_problem(name, password, &dir, me);
+
         assert_eq!(check("clck-fingerprint", Some("swaylock")), None);
         assert_eq!(check("clck-fingerprint", None), None);
-        assert_eq!(check("", None), Some("empty_name"));
-        assert_eq!(check(".", None), Some("invalid_name"));
-        assert_eq!(check("..", None), Some("invalid_name"));
-        assert_eq!(check("../clck-fingerprint", None), Some("invalid_name"));
-        assert_eq!(check("Clck-Fingerprint", None), Some("invalid_name"));
-        assert_eq!(check("clck fingerprint", None), Some("invalid_name"));
+        assert_eq!(check("clck-dash-auth", None), None);
+        assert_eq!(
+            check("clck-link", None),
+            None,
+            "a link to a good file is that file"
+        );
+
+        for stock in [
+            "system-services",
+            "system-auth",
+            "login",
+            "sudo",
+            "other",
+            "swaylock",
+        ] {
+            assert_eq!(check(stock, None), Some("not_dedicated"), "{stock}");
+        }
+        assert_eq!(check("", None), Some("not_dedicated"));
+        assert_eq!(check("clck-", None), Some("invalid_name"));
+        assert_eq!(check("clck-../other", None), Some("invalid_name"));
+        assert_eq!(check("clck-Fingerprint", None), Some("invalid_name"));
+        assert_eq!(check("clck-finger print", None), Some("invalid_name"));
         assert_eq!(
             check("clck-fingerprint", Some("clck-fingerprint")),
             Some("same_as_password_service")
         );
         assert_eq!(
-            check("absent", None),
+            check("clck-fingerprint", Some("Clck-Fingerprint")),
+            Some("same_as_password_service"),
+            "PAM lowercases service names"
+        );
+        assert_eq!(
+            check("clck-absent", None),
             Some("missing"),
             "never PAM's `other`"
         );
-        assert_eq!(check("a-directory", None), Some("missing"));
+        assert_eq!(check("clck-a-directory", None), Some("missing"));
+        assert_eq!(check("clck-no-auth", None), Some("no_auth_line"));
+        assert_eq!(
+            check("clck-group-writable", None),
+            Some("writable_by_others")
+        );
+        assert_eq!(
+            check("clck-other-writable", None),
+            Some("writable_by_others")
+        );
+        if me != 0 {
+            // root reads a mode-000 file anyway
+            assert_eq!(check("clck-unreadable", None), Some("unreadable"));
+        }
+        assert_eq!(
+            service_problem("clck-fingerprint", None, &dir, me.wrapping_add(1)),
+            Some("not_root_owned")
+        );
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -986,6 +1141,7 @@ mod tests {
 
     #[test]
     fn the_child_gets_an_empty_environment_and_no_stdin() {
+        let _serial = serial();
         // The production builder, run against a stand-in program that reports what it received.
         let dir = std::env::temp_dir().join(format!("clck-fp-env-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -1030,6 +1186,7 @@ mod tests {
 
     #[test]
     fn a_stand_in_child_is_collected_and_classified_through_the_real_path() {
+        let _serial = serial();
         fn run(script: &str) -> ChildExit {
             let mut command = Command::new("/bin/sh");
             command
@@ -1079,6 +1236,7 @@ mod tests {
 
     #[test]
     fn a_killed_child_is_reaped_and_reports_a_signal() {
+        let _serial = serial();
         let mut command = Command::new("/bin/sh");
         command
             .arg("-c")
@@ -1113,6 +1271,7 @@ mod tests {
             println!("open-fds-before={before} open-fds={}", open.join(","));
             return;
         }
+        let _serial = serial();
         let mut fds = [-1; 2];
         // SAFETY: two valid slots; plain pipe() leaves both ends inheritable on purpose.
         assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
@@ -1156,6 +1315,7 @@ mod tests {
     /// A `FingerprintPath` whose children are a stand-in shell script, for driving the real
     /// parent-side code (spawn, pidfd, collect, kill, reap) without PAM or a reader.
     struct StandIn {
+        _serial: MutexGuard<'static, ()>,
         dir: PathBuf,
         path: FingerprintPath,
         watched: Vec<OwnedFd>,
@@ -1164,6 +1324,7 @@ mod tests {
 
     impl StandIn {
         fn new(name: &str, script: &str) -> Self {
+            let serial = serial();
             let dir =
                 std::env::temp_dir().join(format!("clck-fp-standin-{}-{name}", std::process::id()));
             std::fs::create_dir_all(&dir).unwrap();
@@ -1178,6 +1339,7 @@ mod tests {
             path.program = program;
             path.on_locked();
             Self {
+                _serial: serial,
                 dir,
                 path,
                 watched: Vec::new(),

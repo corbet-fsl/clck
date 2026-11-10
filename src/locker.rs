@@ -76,9 +76,11 @@ pub struct Config {
     /// OPTIONAL second way in, in parallel with the password (`SESSION-2`): the PAM service of a
     /// fingerprint reader (`/etc/pam.d/<name>`, e.g. one `auth required pam_fprintd.so` line).
     /// `None` -- the default -- means no fingerprint path at all: no child process, no pointer
-    /// binding, no behaviour change. The service must be a plain lowercase name, must exist in
-    /// `/etc/pam.d`, and must differ from `pam_service`; otherwise it is refused and the locker
-    /// stays password-only. The binary that calls [`run`] must not treat clck's hidden child
+    /// binding, no behaviour change. The service must be a dedicated one: named `clck-<lowercase>`,
+    /// a root-owned file in `/etc/pam.d` that nobody else can write, with an `auth` line, and not
+    /// `pam_service`; otherwise it is refused and the locker stays password-only. Whatever that
+    /// stack accepts without a prompt unlocks as soon as the lock is taken, so it should hold the
+    /// fingerprint module alone (`auth required pam_fprintd.so max-tries=1 timeout=30`). The binary that calls [`run`] must not treat clck's hidden child
     /// argument as its own: `run`, `run_daemonized` and [`Builder::run`] dispatch it first.
     pub fingerprint_pam_service: Option<String>,
 }
@@ -234,6 +236,7 @@ fn run_inner(
                 service,
                 Some(&config.pam_service),
                 Path::new(fingerprint::PAM_DIR),
+                0,
             ) {
                 Some(problem) => {
                     eprintln!(
@@ -1275,6 +1278,29 @@ mod tests {
             .next()
             .unwrap();
         assert!(drive.contains("if let Some(generation) = fingerprint.step("));
+    }
+
+    // SESSION-2: every library entry point dispatches the hidden child before doing anything else,
+    // so a binary that embeds clck can never run the locker (or its own code) as the child.
+    #[test]
+    fn every_entry_point_dispatches_the_hidden_child_first() {
+        let production = production_source();
+        for entry in [
+            "pub fn run(config: Config)",
+            "pub fn run_daemonized(config: Config)",
+            "pub fn run(self)",
+        ] {
+            let body = production.split(entry).nth(1).expect(entry);
+            let first = body
+                .split_once('{')
+                .unwrap()
+                .1
+                .lines()
+                .map(str::trim)
+                .find(|line| !line.is_empty())
+                .unwrap();
+            assert_eq!(first, "fingerprint::run_child_if_requested();", "{entry}");
+        }
     }
 
     // SESSION-2: without a configured fingerprint service clck binds no pointer and never reaches

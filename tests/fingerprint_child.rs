@@ -1,12 +1,14 @@
 //! SESSION-2, in the real binary: the hidden fingerprint child (`clck --clck-fingerprint-child`)
 //! never reports a verified finger unless a PAM transaction succeeded. These run the built `clck`
-//! exactly as the locker spawns it, with an empty environment, and need no reader, no fprintd, and
-//! no root: every case here must end WITHOUT the success marker.
+//! exactly as the locker spawns it, with an empty environment, and need no reader, no fprintd and
+//! no root. None of them reaches PAM: an authentication attempt against a real service of the host
+//! running the tests is never made (it could count a failed login in pam_faillock).
 
 use std::process::{Command, Stdio};
 
 const CHILD_ARG: &str = "--clck-fingerprint-child";
 const MARKER: &[u8] = b"clck-fingerprint-verified\n";
+const EXIT_SETUP: i32 = 13;
 
 fn child(args: &[&str]) -> (Option<i32>, Vec<u8>) {
     let output = Command::new(env!("CARGO_BIN_EXE_clck"))
@@ -34,7 +36,7 @@ fn malformed_arguments_end_in_a_setup_failure() {
         vec!["clck-fingerprint", "", &me(), "0"],
     ] {
         let (code, stdout) = child(&args);
-        assert_eq!(code, Some(13), "{args:?}");
+        assert_eq!(code, Some(EXIT_SETUP), "{args:?}");
         assert!(stdout.is_empty(), "{args:?}");
     }
 }
@@ -42,27 +44,28 @@ fn malformed_arguments_end_in_a_setup_failure() {
 #[test]
 fn a_child_whose_parent_is_not_the_locker_refuses_to_run() {
     // The parent pid on the command line is not this process: the child must not authenticate.
-    let (code, stdout) = child(&["other", "nobody", "1", "0"]);
-    assert_eq!(code, Some(13));
+    let (code, stdout) = child(&["clck-test-absent-service", "nobody", "1", "0"]);
+    assert_eq!(code, Some(EXIT_SETUP));
     assert!(stdout.is_empty());
 }
 
 #[test]
-fn a_missing_or_malformed_service_never_reaches_pam() {
-    for service in ["clck-test-absent-service", "../other", "Other", ""] {
+fn stock_missing_or_malformed_services_are_refused_before_pam() {
+    for service in [
+        // Present on most hosts, and refused by name: never a stock service.
+        "other",
+        "system-services",
+        "system-auth",
+        "login",
+        "sudo",
+        // Dedicated name, but no such file here.
+        "clck-test-absent-service",
+        "clck-../other",
+        "clck-Fingerprint",
+        "",
+    ] {
         let (code, stdout) = child(&[service, "nobody", &me(), "0"]);
-        assert_eq!(code, Some(13), "{service:?}");
-        assert!(stdout.is_empty(), "{service:?}");
+        assert_eq!(code, Some(EXIT_SETUP), "{service:?}");
+        assert!(stdout.is_empty() && stdout != MARKER, "{service:?}");
     }
-}
-
-#[test]
-fn a_real_pam_transaction_that_denies_is_never_verified() {
-    // `/etc/pam.d/other` denies on every mainstream distribution (pam_deny); where it does not
-    // exist the child refuses before PAM. Either way: no marker, no status 0. Deliberately not a
-    // password stack such as `login`, whose pam_faillock would count a failure for a real user.
-    let (code, stdout) = child(&["other", "nobody", &me(), "0"]);
-    assert_ne!(code, Some(0));
-    assert!(code.is_some(), "the child crashed instead of exiting");
-    assert!(stdout.is_empty() && stdout != MARKER);
 }

@@ -121,8 +121,10 @@ fn help() {
          CONFIG: $XDG_CONFIG_HOME/clck/config.json\n\
            {{ kiosk_outputs: [..], pam_service: \"..\", socket_path: \"..\", debug: false,\n\
              fingerprint_pam_service: null }}\n\
-           fingerprint_pam_service (optional): a PAM service such as one\n\
-           `auth required pam_fprintd.so` line, tried in parallel with the password.\n\
+           fingerprint_pam_service (optional): a dedicated `clck-*` PAM service, e.g.\n\
+           /etc/pam.d/clck-fingerprint holding exactly\n\
+             auth required pam_fprintd.so max-tries=1 timeout=30\n\
+           tried in parallel with the password; unset, clck is password-only.\n\
          \n\
          The default binary shows the clock lock screen on every `Session` output. A `Kiosk`\n\
          output shows whatever a client streams over the kiosk display Unix socket (DISPLAY-1) --\n\
