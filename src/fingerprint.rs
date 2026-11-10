@@ -789,6 +789,19 @@ mod tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    /// The absolute path of an external tool, from this test process's PATH. The stand-in scripts
+    /// run with the child's EMPTY environment, and a shell without PATH finds nothing on NixOS (no
+    /// /usr/bin there), so every external command in them is spelled out.
+    fn tool(name: &str) -> String {
+        let path = std::env::var_os("PATH").expect("the test process has a PATH");
+        std::env::split_paths(&path)
+            .map(|dir| dir.join(name))
+            .find(|candidate| candidate.is_file())
+            .unwrap_or_else(|| panic!("{name} is not on PATH"))
+            .to_string_lossy()
+            .into_owned()
+    }
+
     fn locked_arm() -> (Arm, Instant) {
         let mut arm = Arm::default();
         arm.on_locked();
@@ -1188,7 +1201,10 @@ mod tests {
         let probe = dir.join("probe");
         std::fs::write(
             &probe,
-            "#!/bin/sh\nif read -r line; then printf 'stdin=readable\\0'; fi\nexec cat /proc/self/environ\n",
+            format!(
+                "#!/bin/sh\nif read -r line; then printf 'stdin=readable\\0'; fi\nexec {} /proc/self/environ\n",
+                tool("cat")
+            ),
         )
         .unwrap();
         std::fs::set_permissions(&probe, std::os::unix::fs::PermissionsExt::from_mode(0o700))
@@ -1271,7 +1287,10 @@ mod tests {
             ChildExit::Failed
         );
         // A grandchild that keeps the pipe open must not stall the collection.
-        assert_eq!(run("sleep 30 & exit 11"), ChildExit::Unavailable);
+        assert_eq!(
+            run(&format!("{} 30 & exit 11", tool("sleep"))),
+            ChildExit::Unavailable
+        );
     }
 
     #[test]
@@ -1280,7 +1299,10 @@ mod tests {
         let mut command = Command::new("/bin/sh");
         command
             .arg("-c")
-            .arg("printf 'clck-fingerprint-verified\\n'; exec sleep 60")
+            .arg(format!(
+                "printf 'clck-fingerprint-verified\\n'; exec {} 60",
+                tool("sleep")
+            ))
             .env_clear()
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -1454,7 +1476,10 @@ mod tests {
         // unlock, and the deadline kill turns the status into a signal.
         let mut fp = StandIn::new(
             "hung",
-            "printf 'clck-fingerprint-verified\\n'; exec sleep 60",
+            &format!(
+                "printf 'clck-fingerprint-verified\\n'; exec {} 60",
+                tool("sleep")
+            ),
         );
         let t0 = Instant::now();
         assert_eq!(fp.step(t0), None);
@@ -1504,7 +1529,7 @@ mod tests {
 
     #[test]
     fn kill_all_ends_the_attempt_in_flight() {
-        let mut fp = StandIn::new("killall", "exec sleep 60");
+        let mut fp = StandIn::new("killall", &format!("exec {} 60", tool("sleep")));
         assert_eq!(fp.step(Instant::now()), None);
         fp.path.kill_all();
         fp.wait_exit();
