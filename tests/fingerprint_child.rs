@@ -11,14 +11,21 @@ const MARKER: &[u8] = b"clck-fingerprint-verified\n";
 const EXIT_SETUP: i32 = 13;
 
 fn child(args: &[&str]) -> (Option<i32>, Vec<u8>) {
-    let output = Command::new(env!("CARGO_BIN_EXE_clck"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_clck"));
+    command
         .arg(CHILD_ARG)
         .args(args)
         .env_clear()
         .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .expect("run clck");
+        .stderr(Stdio::null());
+    // The one exception to the empty environment, and only here: a test binary built inside a nix
+    // shell has no RPATH and loads libpam only through the shell's LD_LIBRARY_PATH (exit 127
+    // without it). The locker itself never passes it on; such a dev build's fingerprint child
+    // simply fails to start, three times, and the locker stays password-only.
+    if let Some(path) = std::env::var_os("LD_LIBRARY_PATH") {
+        command.env("LD_LIBRARY_PATH", path);
+    }
+    let output = command.output().expect("run clck");
     (output.status.code(), output.stdout)
 }
 
