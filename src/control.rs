@@ -198,81 +198,86 @@ mod tests {
         );
     }
 
+    const ALLOWED: [&str; 4] = ["content", "control", "lockscreen", "socket"];
+
+    /// The first thing a production line reaches that the kiosk side may not: a `crate::`/`super::`/`self::` path that is
+    /// not one of the four modules without lock logic (a brace import or a glob would smuggle another one in, so they
+    /// are refused too), or a seat/key/pointer binding, or one of the lock's or the authentication's words.
+    fn forbidden_in(line: &str) -> Option<String> {
+        let mut rest = line;
+        while let Some(at) = ["crate::", "super::", "self::"]
+            .iter()
+            .filter_map(|p| rest.find(p).map(|i| (i, p.len())))
+            .min()
+        {
+            let after = &rest[at.0 + at.1..];
+            let ident: String = after
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            if !ALLOWED.contains(&ident.as_str()) {
+                return Some(format!("reaches {ident:?}; only {ALLOWED:?} are allowed"));
+            }
+            rest = after;
+        }
+        [
+            "SeatState",
+            "wl_seat",
+            "wl_keyboard",
+            "wl_pointer",
+            "KeyboardInteractivity::OnDemand",
+            "KeyboardInteractivity::Exclusive",
+            "session_lock",
+            "SessionLock",
+            "unlock",
+            "pam_client",
+            "Zeroizing",
+            "password",
+            "check_auth",
+            "run_daemonized",
+            "fingerprint",
+        ]
+        .iter()
+        .find(|w| line.contains(**w))
+        .map(|w| format!("mentions {w:?}"))
+    }
+
     /// The kiosk side must have no way to reach the authentication, the fingerprint path, the locker or the session lock.
-    /// Read from the sources (production lines only, comments skipped): every `crate::` / `super::` path may name only the
-    /// four modules that carry no lock logic (a brace import or a glob could smuggle another one in, so they are refused),
-    /// no seat or key/pointer binding exists, and none of the lock's or the authentication's words appear. This is a
-    /// tripwire against an accidental import, not a substitute for the structure: the daemon binds no seat at all.
+    /// Read from the sources (production lines only, comments skipped). A tripwire against an accidental import, not a
+    /// substitute for the structure: the daemon binds no seat at all.
     #[test]
     fn the_kiosk_side_has_no_path_to_the_lock() {
-        const ALLOWED: [&str; 4] = ["content", "control", "lockscreen", "socket"];
         for (name, src) in [
             ("control.rs", include_str!("control.rs")),
             ("kioskd.rs", include_str!("kioskd.rs")),
         ] {
             let prod = src.split("#[cfg(test)]").next().unwrap();
             for line in prod.lines().filter(|l| !l.trim_start().starts_with("//")) {
-                let mut rest = line;
-                while let Some(at) = ["crate::", "super::", "self::"]
-                    .iter()
-                    .filter_map(|p| rest.find(p).map(|i| (i, p.len())))
-                    .min()
-                {
-                    let after = &rest[at.0 + at.1..];
-                    let ident: String = after
-                        .chars()
-                        .take_while(|c| c.is_alphanumeric() || *c == '_')
-                        .collect();
-                    assert!(
-                        ALLOWED.contains(&ident.as_str()),
-                        "{name}: `{line}` reaches {ident:?}; only {ALLOWED:?} are allowed"
-                    );
-                    rest = after;
-                }
-                for word in [
-                    "SeatState",
-                    "wl_seat",
-                    "wl_keyboard",
-                    "wl_pointer",
-                    "KeyboardInteractivity::OnDemand",
-                    "KeyboardInteractivity::Exclusive",
-                    "session_lock",
-                    "SessionLock",
-                    "unlock",
-                    "pam_client",
-                    "Zeroizing",
-                    "password",
-                    "check_auth",
-                    "run_daemonized",
-                    "fingerprint",
-                ] {
-                    assert!(!line.contains(word), "{name}: `{line}` mentions {word:?}");
+                if let Some(why) = forbidden_in(line) {
+                    panic!("{name}: `{line}` {why}");
                 }
             }
         }
     }
 
-    /// The tripwire catches what it claims to: each of these lines must be refused.
+    /// The tripwire is the one the scan uses, and it refuses the ways a path could be smuggled.
     #[test]
     fn the_tripwire_refuses_the_ways_a_path_could_be_smuggled() {
-        let refused = |line: &str| {
-            let mut ok = true;
-            let mut rest = line;
-            while let Some(i) = rest.find("crate::") {
-                let after = &rest[i + 7..];
-                let ident: String = after
-                    .chars()
-                    .take_while(|c| c.is_alphanumeric() || *c == '_')
-                    .collect();
-                ok &= ["content", "control", "lockscreen", "socket"].contains(&ident.as_str());
-                rest = after;
-            }
-            !ok
-        };
-        assert!(refused("use crate::{auth, locker};"));
-        assert!(refused("crate::run(config)"));
-        assert!(refused("crate::check_auth(a, b, c)"));
-        assert!(refused("use crate::*;"));
-        assert!(!refused("use crate::socket::SocketState;"));
+        for line in [
+            "use crate::{auth, locker};",
+            "crate::run(config)",
+            "crate::check_auth(a, b, c)",
+            "use crate::*;",
+            "use super::locker::Locker;",
+            "let s = SeatState::new(&globals, &qh);",
+            "layer.set_keyboard_interactivity(KeyboardInteractivity::OnDemand);",
+        ] {
+            assert!(forbidden_in(line).is_some(), "{line}");
+        }
+        assert!(forbidden_in("use crate::socket::SocketState;").is_none());
+        assert!(
+            forbidden_in("use crate::{content, socket};").is_some(),
+            "a brace import is refused outright"
+        );
     }
 }

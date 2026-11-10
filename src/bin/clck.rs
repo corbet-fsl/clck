@@ -86,6 +86,8 @@ fn read_file_cfg() -> FileCfg {
 
 /// `clck kioskd`: the kiosk without a lock (src/kioskd.rs). Runs until killed.
 fn kioskd_mode() {
+    // Before anything else: `pkill -USR1 clck` (the locker's re-show hook) must not terminate this process too.
+    clck::kioskd::ignore_sigusr1();
     let file = read_file_cfg();
     let config = clck::kioskd::Config {
         kiosk_outputs: file.kiosk_outputs,
@@ -275,6 +277,12 @@ mod tests {
         // each kiosk branch returns: it cannot fall through into the lock
         assert!(main[kioskd..arg_loop].contains("return kioskd_mode()"));
         assert!(main[kiosk..arg_loop].contains("return kiosk_mode("));
+        // the daemon ignores SIGUSR1 before it reads the config or touches a socket
+        let body = include_str!("clck.rs")
+            .split("fn kioskd_mode()")
+            .nth(1)
+            .unwrap();
+        assert!(body.find("ignore_sigusr1()").unwrap() < body.find("read_file_cfg()").unwrap());
     }
 
     #[test]

@@ -159,9 +159,27 @@ fn read_request(s: &mut UnixStream) -> Option<String> {
     String::from_utf8(buf).ok()
 }
 
+/// The live socket may be neither the LOCKER's kiosk socket (`locker`: its configured path, or its default when none is
+/// set, as the locker resolves it) nor this daemon's control socket, whatever spelling the paths have; and only a stale
+/// socket (or nothing) may sit there. Read-only: nothing is created, bound or unlinked.
+fn validate_paths(locker: Option<&Path>, control: &Path, live: Option<&Path>) -> Result<(), Error> {
+    let Some(live) = live else { return Ok(()) };
+    if locker.is_some_and(|l| same_path(l, live)) {
+        return Err(Error::Control(
+            "the live socket must not be the locker's kiosk socket".into(),
+        ));
+    }
+    if same_path(control, live) {
+        return Err(Error::Control(
+            "the live socket must not be the control socket".into(),
+        ));
+    }
+    check_live_path(live).map_err(|e| Error::Control(format!("{}: {e}", live.display())))
+}
+
 /// `kill -USR1 clck` is how the fleet's idle hook tells the LOCKER to re-show its indicator, and its default disposition
 /// terminates; this process is named `clck` too, so it must survive that signal (it has nothing to do with it).
-fn ignore_sigusr1() {
+pub fn ignore_sigusr1() {
     // SAFETY: SIG_IGN installs no handler code; the call is async-signal-safe and runs once at startup.
     unsafe {
         libc::signal(libc::SIGUSR1, libc::SIG_IGN);
@@ -430,26 +448,15 @@ pub fn run(config: Config) -> Result<(), Error> {
         .clone()
         .or_else(|| runtime_path("clck-control.sock"))
         .ok_or_else(|| Error::Control("no XDG_RUNTIME_DIR and no control_socket_path".into()))?;
-    ignore_sigusr1();
     let live_path = config
         .live_socket
         .clone()
         .or_else(|| runtime_path("clck-live.sock"));
-    // The live socket may be neither the LOCKER's kiosk socket (its configured path, or its default when none is set: both
-    // resolved the way the locker resolves them) nor this daemon's control socket, whatever spelling the paths have.
-    if let Some(live) = &live_path {
-        let locker = socket::resolve_path(config.locker_socket.as_deref());
-        if locker.as_deref().is_some_and(|l| same_path(l, live)) {
-            return Err(Error::Control(
-                "the live socket must not be the locker's kiosk socket".into(),
-            ));
-        }
-        if same_path(&control_path, live) {
-            return Err(Error::Control(
-                "the live socket must not be the control socket".into(),
-            ));
-        }
-    }
+    validate_paths(
+        socket::resolve_path(config.locker_socket.as_deref()).as_deref(),
+        &control_path,
+        live_path.as_deref(),
+    )?;
     eprintln!(
         "clck kioskd: kiosk_outputs={:?} control={}",
         config.kiosk_outputs,
@@ -501,7 +508,6 @@ pub fn run(config: Config) -> Result<(), Error> {
     // stale socket is refused instead of being unlinked by the frame server.
     match live_path {
         Some(p) => {
-            check_live_path(&p).map_err(|e| Error::Control(format!("{}: {e}", p.display())))?;
             eprintln!("clck kioskd: live frames on {}", p.display());
             socket::spawn(p, kiosk.socket.clone());
         }
@@ -702,6 +708,16 @@ mod tests {
         }
     }
 
+    /// A listener that was dropped is stale only once no process holds a copy of it: a test child forked by another test of
+    /// this binary keeps one until its exec, so wait (bounded) until nothing answers before asserting "stale".
+    fn wait_stale(p: &Path) {
+        let end = Instant::now() + Duration::from_secs(5);
+        while UnixStream::connect(p).is_ok() {
+            assert!(Instant::now() < end, "{} still answers", p.display());
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     #[test]
     fn the_control_socket_is_0600() {
         let d = Dir::new();
@@ -720,6 +736,7 @@ mod tests {
         );
         drop(live); // the path stays, nobody answers
         assert!(d.sock().exists());
+        wait_stale(&d.sock());
         let _again = bind_control(&d.sock()).unwrap();
 
         let f = Dir::new();
@@ -765,6 +782,9 @@ mod tests {
         let h = std::thread::spawn(move || {
             let mut c = UnixStream::connect(path).unwrap();
             c.write_all(br#"{"cmd":"status"}"#).unwrap();
+            // An explicit half-close: EOF reaches the server at once even if a concurrently forked test child still holds
+            // a copy of this descriptor (dropping it would not).
+            c.shutdown(std::net::Shutdown::Write).unwrap();
         });
         let (mut s, _) = l.accept().unwrap();
         h.join().unwrap();
@@ -827,6 +847,7 @@ mod tests {
             std::io::ErrorKind::AddrInUse
         );
         drop(live);
+        wait_stale(&p);
         assert!(check_live_path(&p).is_ok(), "stale: nobody answers");
     }
 
@@ -834,49 +855,45 @@ mod tests {
     fn the_live_socket_may_not_be_the_lockers_under_another_spelling_or_the_control_socket() {
         let d = Dir::new();
         let locker = d.0.join("locker.sock");
+        let live = d.0.join(".").join("locker.sock");
+        let e = validate_paths(Some(&locker), &d.0.join("c.sock"), Some(&live))
+            .err()
+            .unwrap();
+        assert!(e.to_string().contains("must not be the locker"), "{e}");
+        let e = validate_paths(
+            Some(&locker),
+            &d.0.join("c.sock"),
+            Some(&d.0.join("c.sock")),
+        )
+        .err()
+        .unwrap();
+        assert!(e.to_string().contains("must not be the control"), "{e}");
+        // the locker's DEFAULT path (nothing configured) is passed in already resolved: the same refusal
+        let default = d.0.join("nixlock.sock");
+        assert!(validate_paths(Some(&default), &d.0.join("c.sock"), Some(&default)).is_err());
+        // an unrelated path, a file there, a live socket there
+        let ok = d.0.join("live.sock");
+        assert!(validate_paths(Some(&locker), &d.0.join("c.sock"), Some(&ok)).is_ok());
+        assert!(validate_paths(Some(&locker), &d.0.join("c.sock"), None).is_ok());
+        std::fs::write(&ok, b"precious").unwrap();
+        assert!(validate_paths(Some(&locker), &d.0.join("c.sock"), Some(&ok)).is_err());
+        assert_eq!(std::fs::read(&ok).unwrap(), b"precious");
+    }
+
+    #[test]
+    fn run_refuses_before_it_touches_anything_when_the_paths_clash() {
+        // `run` validates first: no compositor connection, no socket bound. Explicit paths only (no environment).
+        let d = Dir::new();
+        let p = d.0.join("same.sock");
         let e = run(Config {
             kiosk_outputs: vec![],
             control_socket: Some(d.0.join("c.sock")),
-            live_socket: Some(d.0.join(".").join("locker.sock")),
-            locker_socket: Some(locker),
+            live_socket: Some(p.clone()),
+            locker_socket: Some(p),
         })
         .err()
         .unwrap();
         assert!(e.to_string().contains("must not be the locker"), "{e}");
-        let e = run(Config {
-            kiosk_outputs: vec![],
-            control_socket: Some(d.0.join("c.sock")),
-            live_socket: Some(d.0.join("c.sock")),
-            locker_socket: Some(d.0.join("locker.sock")),
-        })
-        .err()
-        .unwrap();
-        assert!(e.to_string().contains("must not be the control"), "{e}");
+        assert!(!d.0.join("c.sock").exists(), "nothing was bound");
     }
-
-    #[test]
-    fn the_lockers_default_socket_is_refused_when_no_path_is_configured() {
-        // `socket::resolve_path(None)` is `$XDG_RUNTIME_DIR/nixlock.sock`: the unset-config case the review found.
-        let d = Dir::new();
-        let _g = ENV.lock().unwrap();
-        let old = std::env::var_os("XDG_RUNTIME_DIR");
-        std::env::set_var("XDG_RUNTIME_DIR", &d.0);
-        let e = run(Config {
-            kiosk_outputs: vec![],
-            control_socket: Some(d.0.join("c.sock")),
-            live_socket: Some(d.0.join("nixlock.sock")),
-            locker_socket: None,
-        })
-        .err();
-        match old {
-            Some(v) => std::env::set_var("XDG_RUNTIME_DIR", v),
-            None => std::env::remove_var("XDG_RUNTIME_DIR"),
-        }
-        assert!(
-            e.unwrap().to_string().contains("must not be the locker"),
-            "the default locker socket must be refused"
-        );
-    }
-
-    static ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
 }
