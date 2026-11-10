@@ -325,7 +325,16 @@ pub(crate) fn service_problem(
     if password_service.is_some_and(|password| password.to_ascii_lowercase() == service) {
         return Some("same_as_password_service");
     }
-    let mut file = match std::fs::File::open(pam_dir.join(service)) {
+    // O_NONBLOCK: a FIFO (or another special file) at that path must fail the regular-file check
+    // below, not hang the locker in open() before it even asks for the lock.
+    let opened = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(pam_dir.join(service))
+    };
+    let mut file = match opened {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Some("missing"),
         Err(_) => return Some("unreadable"),
@@ -351,9 +360,13 @@ pub(crate) fn service_problem(
     {
         return Some("unreadable");
     }
-    let has_auth = text
-        .lines()
-        .any(|line| matches!(line.split_whitespace().next(), Some("auth") | Some("-auth")));
+    // As Linux-PAM reads it: a trailing backslash continues the line, and the type is
+    // case-insensitive. A file without an auth line gets PAM's `other` auth stack instead.
+    let has_auth = text.replace("\\\n", " ").lines().any(|line| {
+        line.split_whitespace().next().is_some_and(|kind| {
+            kind.eq_ignore_ascii_case("auth") || kind.eq_ignore_ascii_case("-auth")
+        })
+    });
     if !has_auth {
         return Some("no_auth_line");
     }
@@ -704,16 +717,17 @@ fn child_exit(code: i32, debug: bool, stage: &str) -> ! {
 
 /// The child: one PAM transaction against the fingerprint service, then exit. Never returns.
 fn child_main(args: &[OsString]) -> ! {
+    // `pkill -USR1 clck` is aimed at the locker (COMPAT-1); it must not cost a pending attempt. Set
+    // before the rename below, which makes this process match `clck` patterns.
+    // SAFETY: SIG_IGN is always a valid disposition.
+    unsafe { libc::signal(libc::SIGUSR1, libc::SIG_IGN) };
+    // Die with the locker. The parent pid check below closes the window in which the parent could
+    // have died before this line.
+    // SAFETY: prctl(PR_SET_PDEATHSIG) only sets this process's parent-death signal.
+    unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) };
     // Exec'd through /proc/self/exe the kernel names this process `exe`; name it for ps/journald.
     // SAFETY: PR_SET_NAME reads a NUL-terminated string of at most 16 bytes.
     unsafe { libc::prctl(libc::PR_SET_NAME, c"clck-fp".as_ptr(), 0, 0, 0) };
-    // Die with the locker. Set first; the parent pid check below closes the window in which the
-    // parent could have died before this line.
-    // SAFETY: prctl(PR_SET_PDEATHSIG) only sets this process's parent-death signal.
-    unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) };
-    // `pkill -USR1 clck` is aimed at the locker (COMPAT-1); it must not cost a pending attempt.
-    // SAFETY: SIG_IGN is always a valid disposition.
-    unsafe { libc::signal(libc::SIGUSR1, libc::SIG_IGN) };
     if close_inherited_fds().is_err() {
         child_exit(EXIT_SETUP, false, "fds");
     }
@@ -1032,6 +1046,7 @@ mod tests {
 
     #[test]
     fn only_a_dedicated_root_style_service_with_an_auth_line_is_accepted() {
+        use std::os::unix::ffi::OsStringExt;
         use std::os::unix::fs::{symlink, PermissionsExt};
         let dir = std::env::temp_dir().join(format!("clck-fp-pamd-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -1043,6 +1058,12 @@ mod tests {
         let good = "# comment\nauth required pam_fprintd.so max-tries=1 timeout=30\n";
         write("clck-fingerprint", good, 0o644);
         write("clck-dash-auth", "-auth required pam_fprintd.so\n", 0o644);
+        write("clck-upper-auth", "AUTH required pam_fprintd.so\n", 0o644);
+        write(
+            "clck-continued",
+            "account required pam_permit.so \\\nauth required pam_fprintd.so\n",
+            0o644,
+        );
         write(
             "clck-no-auth",
             "# auth only in a comment\naccount required pam_permit.so\n",
@@ -1056,6 +1077,10 @@ mod tests {
         write("other", "auth required pam_deny.so\n", 0o644);
         std::fs::create_dir_all(dir.join("clck-a-directory")).unwrap();
         symlink(dir.join("clck-fingerprint"), dir.join("clck-link")).unwrap();
+        let fifo =
+            std::ffi::CString::new(dir.join("clck-fifo").into_os_string().into_vec()).unwrap();
+        // SAFETY: a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o644) }, 0);
 
         // `owner` is this test's own uid: the files are ours, as /etc/pam.d's are root's.
         // SAFETY: getuid has no preconditions.
@@ -1065,6 +1090,16 @@ mod tests {
         assert_eq!(check("clck-fingerprint", Some("swaylock")), None);
         assert_eq!(check("clck-fingerprint", None), None);
         assert_eq!(check("clck-dash-auth", None), None);
+        assert_eq!(
+            check("clck-upper-auth", None),
+            None,
+            "PAM types are case-insensitive"
+        );
+        assert_eq!(
+            check("clck-continued", None),
+            Some("no_auth_line"),
+            "a continuation line belongs to the line before it"
+        );
         assert_eq!(
             check("clck-link", None),
             None,
@@ -1101,6 +1136,11 @@ mod tests {
             "never PAM's `other`"
         );
         assert_eq!(check("clck-a-directory", None), Some("missing"));
+        assert_eq!(
+            check("clck-fifo", None),
+            Some("missing"),
+            "returns instead of blocking"
+        );
         assert_eq!(check("clck-no-auth", None), Some("no_auth_line"));
         assert_eq!(
             check("clck-group-writable", None),
