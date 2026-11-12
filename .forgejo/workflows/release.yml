@@ -16,7 +16,7 @@ on:
         default: ""
 jobs:
   publish:
-    runs-on: heavy
+    runs-on: linux
     timeout-minutes: 5
     steps:
       - name: Hand the commit to the release unit of srv
