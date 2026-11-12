@@ -12,7 +12,7 @@ concurrency:
   cancel-in-progress: true
 jobs:
   verify:
-    runs-on: heavy
+    runs-on: linux
     steps:
       - name: Run verify
         env:
@@ -23,7 +23,7 @@ jobs:
           # and a tool root (CCID_TOOL_ROOT). This step only finds that release and hands over to `ccid job-run`, which holds the actual job logic. It never needs a change.
           triple="${CCID_TOOL_TRIPLE:-$(uname -m)-unknown-linux-gnu}"
           : "${CCID_TOOL_ROOT:?the runner must provide CCID_TOOL_ROOT}"
-          class='heavy'
+          class='linux'
           state="${XDG_CACHE_HOME:-${HOME:-/tmp}/.cache}/ccid-channel"
           mkdir -p "$state" 2>/dev/null || true
           chan=

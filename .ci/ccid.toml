@@ -13,7 +13,7 @@ render_schema = 2
 
 [jobs.verify]
 scheduler = "forgejo"
-runs_on = "heavy"
+runs_on = "linux"
 checks = ["rust"]
 workflow = "ci"
 command = ["bash", ".ci/run-cached.sh"]
