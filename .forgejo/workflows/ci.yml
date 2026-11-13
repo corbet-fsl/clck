@@ -29,7 +29,8 @@ jobs:
           chan=
           if [ -n "${CCID_CHANNEL_URL:-}" ]; then
             chan=$(curl --fail --silent --show-error --location --max-time 30 --retry 3 -H "Authorization: token $CCID_FORGE_TOKEN" "$CCID_CHANNEL_URL" 2>/dev/null || true)
-            if [ -n "$chan" ]; then printf '%s' "$chan" > "$state/last-good.json" 2>/dev/null || true; fi
+            # Atomic: a concurrent job reading the copy never sees it half written (a temporary file in the same directory, then a rename).
+            if [ -n "$chan" ] && part=$(mktemp "$state/last-good.json.XXXXXX" 2>/dev/null); then if printf '%s' "$chan" > "$part" 2>/dev/null; then mv -f "$part" "$state/last-good.json" 2>/dev/null || rm -f "$part" || true; else rm -f "$part" || true; fi; fi
           fi
           # A forge that does not answer must not stop a job: the last channel this runner saw is used (and said so).
           if [ -z "$chan" ] && [ -r "$state/last-good.json" ]; then chan=$(cat "$state/last-good.json"); echo "ccid channel: using the last known channel file" >&2; fi
