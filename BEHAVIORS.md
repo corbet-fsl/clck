@@ -85,15 +85,16 @@ the lock down with it.
 ## Kiosk display socket — content-blind, and never a second way in
 ### DISPLAY-1 — a kiosk output shows the latest streamed frame, or the default clock
 **GIVEN** a `Kiosk` output, **THEN** it displays the most recently accepted frame from the kiosk
-display socket if one exists and its geometry matches the output exactly, and otherwise -- no
-client has ever connected, no frame has arrived yet, the geometry does not match, or the client has
-disconnected -- shows nixlock's own built-in clock. Never a blank output, a frozen last frame past a
-disconnect, or a torn/partial buffer.
+display socket if one exists -- 1:1 when the frame's size equals the output's, otherwise scaled to
+fit (aspect ratio preserved, centred, the rest black) -- and otherwise -- no client has ever
+connected, no frame has arrived yet, or the client has disconnected -- shows nixlock's own built-in
+clock. Never a blank output, a frozen last frame past a disconnect, or a torn/partial buffer.
 
 Why: this generalizes `KIOSK-2` to a client that lives in a whole separate process nixlock does not
 control at all. A dashboard process can crash, hang, or simply not have started yet; the kiosk
 output's failure mode must still be "falls back to something known-safe," exactly as an in-process
-content failure already had to.
+content failure already had to. The client renders at a size of its own choosing and is never told
+the output's; a frame of another size is still the dashboard, so it is fitted rather than refused.
 
 Not: nixlock does not retain or replay the last frame from a client that is no longer connected --
 a disconnect clears back to the clock immediately, not on some later timeout.
@@ -105,8 +106,10 @@ password buffer, the auth state machine, or the compositor's unlock call. `SESSI
 only gate, entirely unaware the socket exists.
 
 Why: a second channel that can influence unlock, even indirectly, would BE the lock's weak point --
-so the socket protocol is deliberately one-directional and content-blind: nixlock parses only a
-width/height header to size and validate a frame, never interprets the pixels themselves.
+so the socket is deliberately one-directional (nixlock writes nothing on it) and content-blind:
+nixlock parses only the image header (`DISPLAY-4`) to size and validate a frame, and only converts
+the pixels (alpha premultiplication, scaling to fit), never interprets them. A test reads the socket
+and image-decoder sources and fails on any mention of the authentication or the unlock call.
 
 Not: nixlock never executes, evaluates, or forwards anything a kiosk client sends. A reverse channel
 (input events flowing client-ward, so a streamed dashboard could itself be interactive) is a
@@ -127,6 +130,24 @@ pathname and `ECONNREFUSED` even though the original process is healthy.
 Not: merely requesting an `ext-session-lock` is not ownership. nixlock resolves the configured
 socket path during startup but does not unlink or bind it until the compositor emits the confirmed
 `locked` event. A rejected process exits through `finished` without publishing a socket.
+
+### DISPLAY-4 — frames are Netpbm PAM images, from this user only, bounded
+**GIVEN** a connection to a kiosk frame socket (the locker's `socket_path`, default
+`$XDG_RUNTIME_DIR/clck.sock`, or `clck kioskd`'s live socket, `KIOSKD-4`), **THEN** nixlock sends
+nothing on it and reads a stream of Netpbm PAM (`P7`) images: `TUPLTYPE RGB_ALPHA` with `DEPTH 4`
+(straight alpha, premultiplied on receipt) or `TUPLTYPE RGB` with `DEPTH 3`, `MAXVAL 255`, `WIDTH`
+and `HEIGHT` each `1..=8192`, a header of at most 1 KiB, then exactly `WIDTH * HEIGHT * DEPTH`
+raster bytes. It closes the connection when the peer is not the same user (`SO_PEERCRED`, checked
+before the connection may replace the current one), on any other header, and when an image whose
+first byte has arrived is not complete within 10 s. While no kiosk output exists, images are read
+and discarded. One client at a time: a new connection replaces the previous one.
+
+Why: a standard format that any program, netpbm's own tools included, can write, instead of a private
+wire only one client speaks. The limits bound what a client can make nixlock allocate or wait for;
+the same-user rule keeps the socket the session's own whatever the runtime directory's permissions.
+
+Not: nixlock never negotiates a size or reports its output's geometry, and never tries to
+resynchronize a stream past an image it refused.
 
 ## Kiosk without a lock — `clck kioskd`, a display that is never a second locker
 ### KIOSKD-1 — the lock-less kiosk shares nothing with the lock path
@@ -157,7 +178,7 @@ removed.
 
 ### KIOSKD-4 — its own frame socket, never the locker's
 **GIVEN** a frame client (e.g. cksk), **THEN** it streams to the daemon's OWN live socket (`live_socket_path`, default
-`$XDG_RUNTIME_DIR/clck-live.sock`) over the same content-blind wire as `DISPLAY-1`/`DISPLAY-2`; the daemon refuses to start
+`$XDG_RUNTIME_DIR/clck-live.sock`) with the same frame input as the locker's (`DISPLAY-1`, `DISPLAY-2`, `DISPLAY-4`); the daemon refuses to start
 when that path is the locker's `socket_path`, so `DISPLAY-3` (only the accepted locker publishes ITS socket) is untouched. The
 latest valid frame is painted while the kiosk is on, else the built-in clock.
 

@@ -1,7 +1,10 @@
 //! End to end on a THROWAWAY headless compositor (skipped unless `scroll` (or `sway`) and `grim` are installed): `clck kioskd`
-//! shows the overlay on the kiosk output on `kiosk on` and removes it on `kiosk off`, seen in a screenshot of the output.
-//! The compositor gets its own `$XDG_RUNTIME_DIR`, so it can never reach a live session's sockets.
+//! shows the overlay on the kiosk output on `kiosk on` and removes it on `kiosk off`, and a Netpbm PAM image written to its
+//! live socket appears on the output (scaled to fit when its size differs, 1:1 when it matches), seen in screenshots of the
+//! output. The compositor gets its own `$XDG_RUNTIME_DIR`, so it can never reach a live session's sockets.
 
+use std::io::Write;
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -36,10 +39,9 @@ fn wait(what: &str, mut f: impl FnMut() -> bool) {
     panic!("timed out waiting for {what}");
 }
 
-/// Non-zero bytes of a PPM screenshot's pixel data.
-fn painted(path: &Path) -> usize {
+/// A PPM screenshot's width and pixel data: "P6\nW H\n255\n", then the pixels.
+fn ppm(path: &Path) -> (usize, Vec<u8>) {
     let d = std::fs::read(path).unwrap();
-    // "P6\nW H\n255\n" then the pixels
     let mut nl = 0;
     let mut at = 0;
     for (i, b) in d.iter().enumerate() {
@@ -51,7 +53,38 @@ fn painted(path: &Path) -> usize {
             }
         }
     }
-    d[at..].iter().filter(|b| **b != 0).count()
+    let head = String::from_utf8_lossy(&d[..at]).into_owned();
+    let width = head
+        .split_ascii_whitespace()
+        .nth(1)
+        .unwrap()
+        .parse()
+        .unwrap();
+    (width, d[at..].to_vec())
+}
+
+/// Non-zero bytes of a PPM screenshot's pixel data.
+fn painted(path: &Path) -> usize {
+    ppm(path).1.iter().filter(|b| **b != 0).count()
+}
+
+/// One pixel of a PPM screenshot.
+fn pixel(path: &Path, x: usize, y: usize) -> [u8; 3] {
+    let (width, px) = ppm(path);
+    let i = (y * width + x) * 3;
+    px[i..i + 3].try_into().unwrap()
+}
+
+/// One Netpbm PAM image of a single straight-alpha colour.
+fn pam(width: u32, height: u32, rgba: [u8; 4]) -> Vec<u8> {
+    let mut v = format!(
+        "P7\nWIDTH {width}\nHEIGHT {height}\nDEPTH 4\nMAXVAL 255\nTUPLTYPE RGB_ALPHA\nENDHDR\n"
+    )
+    .into_bytes();
+    for _ in 0..width * height {
+        v.extend_from_slice(&rgba);
+    }
+    v
 }
 
 #[test]
@@ -164,6 +197,33 @@ fn kiosk_on_draws_the_overlay_and_off_removes_it() {
         0,
         "an output that is not a kiosk output stays untouched"
     );
+
+    // A frame client: no greeting to read, it just writes images. 320x90 onto the 640x360 output is scaled by 2 to a
+    // 640x180 band centred vertically (rows 90..270), black above and below.
+    let mut client = UnixStream::connect(rt.join("clck-live.sock")).unwrap();
+    client.write_all(&pam(320, 90, [255, 0, 0, 255])).unwrap();
+    let at = |name: &str, x: usize, y: usize| -> [u8; 3] {
+        shot(name, "HEADLESS-1");
+        pixel(&rt.join(format!("{name}.ppm")), x, y)
+    };
+    wait("the scaled frame", || at("s1", 320, 180) == [255, 0, 0]);
+    assert_eq!(at("s2", 320, 20), [0, 0, 0], "black above the fitted frame");
+    assert_eq!(
+        at("s3", 320, 340),
+        [0, 0, 0],
+        "black below the fitted frame"
+    );
+    assert_eq!(
+        at("s4", 0, 91),
+        [255, 0, 0],
+        "the band reaches the left edge"
+    );
+    assert_eq!(at("s5", 639, 268), [255, 0, 0], "and the right edge");
+    // The output's own size is shown 1:1, edge to edge.
+    client.write_all(&pam(640, 360, [0, 0, 255, 255])).unwrap();
+    wait("the 1:1 frame", || at("o1", 0, 0) == [0, 0, 255]);
+    assert_eq!(at("o2", 639, 359), [0, 0, 255]);
+    assert_eq!(shot("o3", "HEADLESS-2"), 0, "never on another output");
     let (ok, out) = kiosk("off");
     assert!(ok && out.contains(r#""kiosk":"off""#), "{out}");
     wait("the overlay to go", || shot("c1", "HEADLESS-1") == 0);

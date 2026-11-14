@@ -1,72 +1,93 @@
-//! The kiosk display SOCKET SERVER: a content-BLIND Unix-domain frame receiver. Exactly one
-//! external client at a time (`nixwatch-frames`, or anything speaking the same wire protocol)
-//! streams premultiplied RGBA frames in; the render path (`locker.rs`) blits the latest one onto
-//! the KIOSK output and falls back to clck's own built-in clock whenever no frame has ever
-//! arrived, the frame's geometry does not match the kiosk output, or the client has disconnected.
+//! The kiosk frame SOCKET SERVER: a content-BLIND Unix-domain frame receiver. One client at a time (cksk, or anything
+//! that writes Netpbm PAM images) streams frames in; the render paths (`locker.rs`, `kioskd.rs`) paint the latest one on
+//! the KIOSK output and fall back to clck's own built-in clock while no frame has arrived or once the client is gone.
 //!
-//! WIRE PROTOCOL v1 (all integers little-endian):
-//!   - on connect, this server immediately writes a HELLO: 8-byte magic `b"CLCK1"`, then
-//!     `width: u32`, `height: u32`, `scale: u32` -- the kiosk output's current geometry. `0,0,0`
-//!     means "no kiosk output" (either none is configured on this host, or the compositor has not
-//!     sent its first surface `configure` yet -- see `SocketState::geometry`'s own doc).
-//!   - the client then sends repeated FRAMES: `width: u32`, `height: u32`, then exactly
-//!     `width*height*4` bytes of premultiplied RGBA (row-major, top-down, stride = width*4).
-//!   - a frame whose geometry does not match the kiosk output is dropped (never blitted) and the
-//!     connection is kept; a genuinely truncated read (the stream itself ended mid-frame) is
-//!     treated the same as a clean disconnect, since there is no way to resynchronize a byte
-//!     stream without knowing how much of it to discard.
+//! FRAME INPUT, Netpbm PAM over a Unix socket (README "Frame input"; BEHAVIORS.md DISPLAY-1, DISPLAY-2, DISPLAY-4):
+//!   - the server writes NOTHING on the socket: no greeting, no reply. A client connects and writes images.
+//!   - the stream is a sequence of PAM (`P7`) images, each a header and then exactly `WIDTH * HEIGHT * DEPTH` raster
+//!     bytes. `crate::netpbm` holds what is accepted: `TUPLTYPE RGB_ALPHA` with `DEPTH 4` (straight alpha) or
+//!     `TUPLTYPE RGB` with `DEPTH 3`, `MAXVAL 255`, a header of at most 1 KiB, `WIDTH` and `HEIGHT` each `1..=8192`.
+//!     Anything else closes the connection: a byte stream cannot be resynchronized after an image it does not understand.
+//!   - the peer must be this process's own user (`SO_PEERCRED`); any other is closed at once, before it can replace the
+//!     current client.
+//!   - once an image's first byte has arrived, the whole image must arrive within `FRAME_DEADLINE` (10 s), else the
+//!     connection is closed. Between images a client may stay idle for as long as it likes.
+//!   - an accepted image of any size is kept; the render path shows it 1:1 when it matches the kiosk output and scales it
+//!     to fit otherwise, aspect preserved, centred on black (`LatestFrame::fit`).
+//!   - while there is no kiosk output, images are read and discarded.
+//!   - a new connection replaces the previous one (one client at a time, the latest wins); a disconnect clears the frame
+//!     and the kiosk goes back to the clock.
 //!
-//! DISPLAY-ONLY, PERMANENTLY (BEHAVIORS.md DISPLAY-2): this module only ever turns received bytes
-//! into pixels for one output. It has no path to `Locker`'s password buffer, auth state, or the
-//! session-lock unlock call -- SESSION-1 stays the only gate, entirely untouched by anything here.
-//! A reverse channel (input events client-ward, so a streamed dashboard could itself be
-//! interactive) is a plausible future addition -- deliberately NOT built here; it would need its
-//! own careful accounting against KIOSK-1 (kiosk surfaces are input-inert) before it could exist
-//! at all.
-use std::io::{ErrorKind, Read, Write};
+//! DISPLAY-ONLY, PERMANENTLY (BEHAVIORS.md DISPLAY-2): this module only ever turns received bytes into pixels for one
+//! output. It has no path to `Locker`'s password buffer, auth state, or the session-lock unlock call -- SESSION-1 stays
+//! the only gate, entirely untouched by anything here. A reverse channel (input events client-ward, so a streamed
+//! dashboard could itself be interactive) is a plausible future addition -- deliberately NOT built here; it would need its
+//! own careful accounting against KIOSK-1 (kiosk surfaces are input-inert) before it could exist at all.
+use crate::netpbm;
+use std::io::{BufRead, BufReader, ErrorKind, Read};
 use std::net::Shutdown;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
-// The handshake magic is the deployed wire protocol's, kept byte-identical so today's cksk
-// (and yesterday's nixwatch-frames) validate it. Never rename this to match the server:
-// the magic names the WIRE, not the program.
-pub const MAGIC: &[u8; 8] = b"NIXLOCK1";
+/// An image whose first byte has arrived must be complete within this long, or the connection is closed.
+pub const FRAME_DEADLINE: Duration = Duration::from_secs(10);
 
-/// A frame this large is never legitimate for a real display, at any DPI this framework will ever
-/// run on -- guards against a garbled or hostile length prefix turning into a multi-gigabyte
-/// allocation. Purely a defensive backstop; the normal rejection path is the geometry check below.
-const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
-
-/// The most recently fully-received, geometry-valid frame -- or `None` while no client has ever
-/// sent one, or after the streaming client disconnects.
+/// The most recently fully-received frame, as premultiplied RGBA8 at the size the client sent -- or `None` while no client
+/// has sent one, after the streaming client disconnects, or while there is no kiosk output.
 pub struct LatestFrame {
     pub width: u32,
     pub height: u32,
     pub rgba: Vec<u8>,
 }
 
-/// Shared state the render path (`locker.rs`) reads and this module's accept/read threads write.
+impl LatestFrame {
+    /// This frame as premultiplied RGBA8 for a `width` x `height` surface: the frame itself when the sizes match (1:1),
+    /// otherwise scaled to fit, aspect preserved, centred on black. `None` only for a surface without area.
+    pub fn fit(&self, width: u32, height: u32) -> Option<Vec<u8>> {
+        if (self.width, self.height) == (width, height) {
+            return Some(self.rgba.clone());
+        }
+        let src = tiny_skia::PixmapRef::from_bytes(&self.rgba, self.width, self.height)?;
+        let mut dst = tiny_skia::Pixmap::new(width, height)?;
+        dst.fill(tiny_skia::Color::BLACK);
+        let scale = (width as f32 / self.width as f32).min(height as f32 / self.height as f32);
+        let (w, h) = (self.width as f32 * scale, self.height as f32 * scale);
+        // Whole-pixel offsets: the fitted image starts on a pixel edge.
+        let x = ((width as f32 - w) / 2.0).floor();
+        let y = ((height as f32 - h) / 2.0).floor();
+        dst.draw_pixmap(
+            0,
+            0,
+            src,
+            &tiny_skia::PixmapPaint {
+                quality: tiny_skia::FilterQuality::Bilinear,
+                ..Default::default()
+            },
+            tiny_skia::Transform::from_row(scale, 0.0, 0.0, scale, x, y),
+            None,
+        );
+        Some(dst.take())
+    }
+}
+
+/// Shared state the render path (`locker.rs`, `kioskd.rs`) reads and this module's accept/read threads write.
 pub struct SocketState {
     pub latest: Mutex<Option<LatestFrame>>,
-    /// Current kiosk output geometry (width, height, scale) -- `(0, 0, 0)` means "no kiosk
-    /// output": either `kiosk_outputs` is empty (permanent, by construction) or the compositor
-    /// has not yet sent the kiosk surface's first `configure` (a narrow startup race -- a client
-    /// connecting in that window sees `0,0,0` too and should idle/retry exactly as it would for
-    /// the permanent case; see the wire protocol doc above).
-    geometry: Mutex<(u32, u32, u32)>,
-    /// Set once the caller's calloop event loop exists, so a newly-accepted frame can wake a
-    /// repaint immediately instead of waiting for the 1s tick. `None` early at startup is fine --
-    /// the periodic tick still repaints eventually (see `locker.rs`'s own timer).
+    /// Whether a kiosk output exists to show a frame on. While it does not -- `kiosk_outputs` is empty, or the compositor
+    /// has not described or configured the kiosk output yet, or it was unplugged -- received frames are discarded.
+    /// Read and written only while holding `latest`, so a frame is never stored after the output went away.
+    kiosk_output: AtomicBool,
+    /// Set once the caller's calloop event loop exists, so a newly-accepted frame can wake a repaint immediately instead
+    /// of waiting for the 1s tick. `None` early at startup is fine -- the periodic tick still repaints eventually.
     ping: Mutex<Option<calloop::ping::Ping>>,
-    /// Monotonic id of the current connection; a superseded (older) connection's handler thread
-    /// checks this and exits rather than going on writing frames nobody will read.
+    /// Monotonic id of the current connection; a superseded (older) connection's handler thread checks this and exits
+    /// rather than going on storing frames nobody will read.
     active_gen: AtomicU64,
-    /// A clone of the currently-active stream, kept ONLY so a new connection can `shutdown()` the
-    /// previous one -- unblocking its handler thread out of a pending `read` (one client at a
-    /// time: a new connection replaces the old, per the protocol doc in `locker.rs`/README).
+    /// A clone of the currently-active stream, kept ONLY so a new connection can `shutdown()` the previous one --
+    /// unblocking its handler thread out of a pending `read` (one client at a time: a new connection replaces the old).
     active_stream: Mutex<Option<UnixStream>>,
 }
 
@@ -74,16 +95,21 @@ impl SocketState {
     pub fn new() -> Arc<Self> {
         Arc::new(SocketState {
             latest: Mutex::new(None),
-            geometry: Mutex::new((0, 0, 0)),
+            kiosk_output: AtomicBool::new(false),
             ping: Mutex::new(None),
             active_gen: AtomicU64::new(0),
             active_stream: Mutex::new(None),
         })
     }
 
-    /// Called by `locker.rs` whenever the kiosk output's surface configures (or reconfigures).
-    pub fn set_geometry(&self, width: u32, height: u32, scale: u32) {
-        *self.geometry.lock().unwrap() = (width, height, scale);
+    /// Called by the render path whenever its kiosk outputs change: `true` while at least one exists to paint on.
+    /// Losing the last one drops the held frame; frames are then discarded until one is back.
+    pub fn set_kiosk_output(&self, present: bool) {
+        let mut latest = self.latest.lock().unwrap();
+        self.kiosk_output.store(present, Ordering::SeqCst);
+        if !present {
+            *latest = None;
+        }
     }
 
     /// Called once the caller's `EventLoop` and its ping source exist.
@@ -92,26 +118,23 @@ impl SocketState {
     }
 }
 
-/// Resolve the socket path: the configured value, else `$XDG_RUNTIME_DIR/nixlock.sock`. `None`
-/// when neither is available -- the caller then skips the socket server entirely. A display
-/// feature must never block or weaken the lock itself (DISPLAY-2), so a missing/misconfigured
-/// socket is a silent-degrade-to-clock, never a startup failure.
-///
-/// The filename keeps the previous product name on purpose: deployed cksk clients dial it
-/// (with a clck.sock-first fallback), and renaming the default is a deploy step -- the wire
-/// (HELLO magic, framing) is versioned separately and does not follow filenames.
+/// Resolve the socket path: the configured value, else `$XDG_RUNTIME_DIR/clck.sock`. `None` when neither is available
+/// -- the caller then skips the socket server entirely. A display feature must never block or weaken the lock itself
+/// (DISPLAY-2), so a missing/misconfigured socket is a silent-degrade-to-clock, never a startup failure.
 pub fn resolve_path(configured: Option<&Path>) -> Option<PathBuf> {
     configured.map(Path::to_path_buf).or_else(|| {
-        std::env::var_os("XDG_RUNTIME_DIR").map(|d| PathBuf::from(d).join("nixlock.sock"))
+        std::env::var_os("XDG_RUNTIME_DIR")
+            .filter(|d| !d.is_empty())
+            .map(|d| PathBuf::from(d).join("clck.sock"))
     })
 }
 
-/// Starts the listener thread. Best-effort: a bind failure is logged and the kiosk stays on the
-/// default clock forever (never a reason to fail the lock itself -- see `resolve_path` above).
+/// Starts the listener thread. Best-effort: a bind failure is logged and the kiosk stays on the default clock forever
+/// (never a reason to fail the lock itself -- see `resolve_path` above).
 pub fn spawn(path: PathBuf, state: Arc<SocketState>) {
     std::thread::spawn(move || {
-        // Unlink a stale socket from a previous, uncleanly-exited run before binding -- otherwise
-        // `bind` fails with AddrInUse against a path nothing is actually listening on any more.
+        // Unlink a stale socket from a previous, uncleanly-exited run before binding -- otherwise `bind` fails with
+        // AddrInUse against a path nothing is actually listening on any more.
         let _ = std::fs::remove_file(&path);
         let listener = match UnixListener::bind(&path) {
             Ok(l) => l,
@@ -133,20 +156,37 @@ pub fn spawn(path: PathBuf, state: Arc<SocketState>) {
     });
 }
 
-fn accept_one(mut stream: UnixStream, state: &Arc<SocketState>) {
-    // One client at a time: this connection becomes the new active one, and whatever was active
-    // before it gets shut down so its handler thread unblocks out of its read and exits cleanly.
+/// The peer's user id, from the kernel (`SO_PEERCRED`), never from anything the peer sends.
+fn peer_uid(stream: &UnixStream) -> std::io::Result<u32> {
+    let cred = rustix::net::sockopt::socket_peercred(stream).map_err(std::io::Error::from)?;
+    Ok(cred.uid.as_raw())
+}
+
+fn own_uid() -> u32 {
+    rustix::process::getuid().as_raw()
+}
+
+fn accept_one(stream: UnixStream, state: &Arc<SocketState>) {
+    // The same-user rule comes first: a refused peer is closed (dropped) before it can replace the current client.
+    match peer_uid(&stream) {
+        Ok(uid) if uid == own_uid() => {}
+        Ok(uid) => {
+            eprintln!("clck: socket: refused a client of uid {uid} (only this user may stream)");
+            return;
+        }
+        Err(e) => {
+            eprintln!("clck: socket: peer credentials unavailable ({e}); closed");
+            return;
+        }
+    }
+
+    // One client at a time: this connection becomes the new active one, and whatever was active before it gets shut
+    // down so its handler thread unblocks out of its read and exits cleanly.
     let my_gen = state.active_gen.fetch_add(1, Ordering::SeqCst) + 1;
     if let Some(old) = state.active_stream.lock().unwrap().take() {
         let _ = old.shutdown(Shutdown::Both);
     }
-
-    let (w, h, scale) = *state.geometry.lock().unwrap();
-    if let Err(e) = write_hello(&mut stream, w, h, scale) {
-        eprintln!("clck: socket: HELLO write failed: {e}");
-        return;
-    }
-    eprintln!("clck: socket: client connected, geometry {w}x{h}");
+    eprintln!("clck: socket: client connected");
 
     let reader = match stream.try_clone() {
         Ok(s) => s,
@@ -158,67 +198,105 @@ fn accept_one(mut stream: UnixStream, state: &Arc<SocketState>) {
     *state.active_stream.lock().unwrap() = Some(stream);
 
     let state = Arc::clone(state);
-    std::thread::spawn(move || read_frames(reader, my_gen, state));
+    std::thread::spawn(move || read_frames(reader, my_gen, state, FRAME_DEADLINE));
 }
 
-fn write_hello(
-    stream: &mut UnixStream,
-    width: u32,
-    height: u32,
-    scale: u32,
-) -> std::io::Result<()> {
-    let mut buf = Vec::with_capacity(8 + 12);
-    buf.extend_from_slice(MAGIC);
-    buf.extend_from_slice(&width.to_le_bytes());
-    buf.extend_from_slice(&height.to_le_bytes());
-    buf.extend_from_slice(&scale.to_le_bytes());
-    stream.write_all(&buf)
+/// The stream as a reader with an optional deadline: while `until` is set, every read waits at most until then and a
+/// read past it fails with `TimedOut`. One deadline for the whole image, not per read, so a peer that trickles a byte
+/// at a time is let go at the deadline too.
+struct Deadline {
+    stream: UnixStream,
+    until: Option<Instant>,
 }
 
-fn read_frames(mut stream: UnixStream, my_gen: u64, state: Arc<SocketState>) {
-    let mut header = [0u8; 8];
+impl Read for Deadline {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let stalled =
+            || std::io::Error::new(ErrorKind::TimedOut, "the image was not complete in time");
+        let wait = match self.until {
+            None => None,
+            Some(until) => match until.checked_duration_since(Instant::now()) {
+                Some(left) if !left.is_zero() => Some(left),
+                _ => return Err(stalled()),
+            },
+        };
+        self.stream.set_read_timeout(wait)?;
+        match self.stream.read(buf) {
+            Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                Err(stalled())
+            }
+            other => other,
+        }
+    }
+}
+
+fn read_frames(stream: UnixStream, my_gen: u64, state: Arc<SocketState>, deadline: Duration) {
+    let current = || state.active_gen.load(Ordering::SeqCst) == my_gen;
+    let mut reader = BufReader::with_capacity(
+        64 * 1024,
+        Deadline {
+            stream,
+            until: None,
+        },
+    );
+    let mut logged_size = None;
+    let mut discarding = false;
     loop {
-        if state.active_gen.load(Ordering::SeqCst) != my_gen {
+        if !current() {
             break; // superseded by a newer connection; that thread already owns the display
         }
-        if let Err(e) = stream.read_exact(&mut header) {
-            if e.kind() != ErrorKind::UnexpectedEof {
-                eprintln!("clck: socket: read frame header failed: {e}");
+        // Between images there is no deadline: a client may stay connected and quiet for good.
+        reader.get_mut().until = None;
+        match reader.fill_buf() {
+            Ok([]) => break, // a clean end between images
+            Ok(_) => {}
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(e) => {
+                eprintln!("clck: socket: read failed: {e}");
+                break;
             }
-            break; // clean EOF or a real error -- either way, the client is gone
         }
-        let width = u32::from_le_bytes(header[0..4].try_into().unwrap());
-        let height = u32::from_le_bytes(header[4..8].try_into().unwrap());
-        let expect = (width as usize)
-            .saturating_mul(height as usize)
-            .saturating_mul(4);
-        if expect == 0 || expect > MAX_FRAME_BYTES {
-            eprintln!("clck: socket: frame {width}x{height} rejected (implausible size); closing");
-            break; // no reliable way to resync the byte stream without a valid length
-        }
-        let mut payload = vec![0u8; expect];
-        if let Err(e) = stream.read_exact(&mut payload) {
-            eprintln!("clck: socket: frame {width}x{height} truncated: {e}; closing");
+        // The image has started: all of it must arrive within the deadline.
+        reader.get_mut().until = Some(Instant::now() + deadline);
+        let image = netpbm::read_header(&mut reader)
+            .and_then(|h| netpbm::read_raster(&mut reader, &h).map(|rgba| (h, rgba)));
+        let (header, rgba) = match image {
+            Ok(image) => image,
+            Err(e) => {
+                eprintln!("clck: socket: {e}; closing");
+                break; // no reliable way to resync the byte stream past an image it could not take
+            }
+        };
+        let mut latest = state.latest.lock().unwrap();
+        if !current() {
             break;
         }
-        let (ew, eh, _) = *state.geometry.lock().unwrap();
-        if width != ew || height != eh {
-            eprintln!("clck: socket: frame {width}x{height} rejected (kiosk is {ew}x{eh})");
-            continue; // FRAME validation: fully read, but dropped -- never blitted, connection kept
+        if !state.kiosk_output.load(Ordering::SeqCst) {
+            if !discarding {
+                eprintln!("clck: socket: no kiosk output; frames are discarded until there is one");
+                discarding = true;
+            }
+            continue;
         }
-        eprintln!("clck: socket: frame {width}x{height} accepted");
-        *state.latest.lock().unwrap() = Some(LatestFrame {
-            width,
-            height,
-            rgba: payload,
+        discarding = false;
+        let size = (header.width, header.height);
+        if logged_size != Some(size) {
+            eprintln!("clck: socket: frame {}x{} accepted", size.0, size.1);
+            logged_size = Some(size);
+        }
+        *latest = Some(LatestFrame {
+            width: header.width,
+            height: header.height,
+            rgba,
         });
+        drop(latest);
         if let Some(ping) = state.ping.lock().unwrap().as_ref() {
             ping.ping();
         }
     }
-    // Only the still-current generation clears the frame back to the default clock -- a
-    // superseded connection's late exit must never stomp the NEW connection's already-live frame.
-    if state.active_gen.load(Ordering::SeqCst) == my_gen {
+    // Only the still-current generation clears the frame back to the default clock -- a superseded connection's late
+    // exit must never stomp the NEW connection's already-live frame.
+    if current() {
         *state.latest.lock().unwrap() = None;
         eprintln!("clck: socket: client disconnected; kiosk falls back to the default clock");
     }
@@ -227,28 +305,44 @@ fn read_frames(mut stream: UnixStream, my_gen: u64, state: Arc<SocketState>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{Duration, Instant};
+    use std::io::Write;
 
-    /// Drive `read_frames` exactly as production does -- on its own thread, against a real
-    /// `UnixStream` pair. Returns the writable client end and a join handle.
-    fn serve(state: &Arc<SocketState>) -> (UnixStream, std::thread::JoinHandle<()>) {
+    /// Drive `read_frames` exactly as production does -- on its own thread, against a real `UnixStream` pair -- with the
+    /// given image deadline. Returns the writable client end and a join handle.
+    fn serve_with(
+        state: &Arc<SocketState>,
+        deadline: Duration,
+    ) -> (UnixStream, std::thread::JoinHandle<()>) {
         let (client, server) = UnixStream::pair().unwrap();
         let my_gen = state.active_gen.fetch_add(1, Ordering::SeqCst) + 1;
         let st = Arc::clone(state);
-        let h = std::thread::spawn(move || read_frames(server, my_gen, st));
+        let h = std::thread::spawn(move || read_frames(server, my_gen, st, deadline));
         (client, h)
     }
 
-    fn frame(width: u32, height: u32, fill: u8) -> Vec<u8> {
-        let mut v = Vec::new();
-        v.extend_from_slice(&width.to_le_bytes());
-        v.extend_from_slice(&height.to_le_bytes());
-        v.resize(8 + (width as usize) * (height as usize) * 4, fill);
+    fn serve(state: &Arc<SocketState>) -> (UnixStream, std::thread::JoinHandle<()>) {
+        serve_with(state, FRAME_DEADLINE)
+    }
+
+    fn with_output() -> Arc<SocketState> {
+        let state = SocketState::new();
+        state.set_kiosk_output(true);
+        state
+    }
+
+    /// One RGB_ALPHA image, every pixel the straight-alpha `px`.
+    fn image(width: u32, height: u32, px: [u8; 4]) -> Vec<u8> {
+        let mut v = format!(
+            "P7\nWIDTH {width}\nHEIGHT {height}\nDEPTH 4\nMAXVAL 255\nTUPLTYPE RGB_ALPHA\nENDHDR\n"
+        )
+        .into_bytes();
+        for _ in 0..width * height {
+            v.extend_from_slice(&px);
+        }
         v
     }
 
-    /// These are threaded handoffs, so the assertion is "reaches this state within a bound",
-    /// never a fixed sleep.
+    /// These are threaded handoffs, so the assertion is "reaches this state within a bound", never a fixed sleep.
     fn within<F: Fn() -> bool>(f: F) -> bool {
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline {
@@ -260,17 +354,19 @@ mod tests {
         false
     }
 
-    fn latest_fill(state: &SocketState) -> Option<u8> {
-        state.latest.lock().unwrap().as_ref().map(|f| f.rgba[0])
+    fn latest_px(state: &SocketState) -> Option<[u8; 4]> {
+        state
+            .latest
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|f| f.rgba[0..4].try_into().unwrap())
     }
 
-    /// Nothing becomes visible for a bounded window. A negative observation, not a proof of never
-    /// -- but the accepting path above lands in single-digit milliseconds, so a frame that has not
-    /// appeared in 300ms was rejected, not merely slow.
+    /// Nothing becomes visible for a bounded window. A negative observation, not a proof of never -- but the accepting
+    /// path lands in single-digit milliseconds, so a frame that has not appeared in 300ms was rejected, not merely slow.
     ///
-    /// It has to be observed WHILE THE CLIENT IS STILL CONNECTED. Asserting `latest.is_none()`
-    /// after a disconnect proves nothing at all, because disconnecting is itself defined to clear
-    /// the frame -- a mutation that deleted the geometry check entirely passed that way.
+    /// It has to be observed WHILE THE CLIENT IS STILL CONNECTED: disconnecting is itself defined to clear the frame.
     fn stays_empty(state: &SocketState) -> bool {
         let deadline = Instant::now() + Duration::from_millis(300);
         while Instant::now() < deadline {
@@ -282,39 +378,82 @@ mod tests {
         true
     }
 
+    /// The server closed the connection: the client reads EOF, or a reset when the server left bytes of ours unread
+    /// (bounded, so a server that keeps reading fails cleanly instead of hanging the test).
+    fn closed_by_server(client: &mut UnixStream) -> bool {
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut sink = [0u8; 1];
+        match client.read(&mut sink) {
+            Ok(0) => true,
+            Err(e) => e.kind() == ErrorKind::ConnectionReset,
+            Ok(_) => false,
+        }
+    }
+
     // ── DISPLAY-1 ────────────────────────────────────────────────────────────────────────────
 
     #[test]
-    fn a_frame_matching_the_kiosk_geometry_is_accepted() {
-        let state = SocketState::new();
-        state.set_geometry(4, 2, 1);
+    fn an_image_is_accepted_and_kept_premultiplied() {
+        let state = with_output();
         let (mut client, h) = serve(&state);
 
-        client.write_all(&frame(4, 2, 0xAB)).unwrap();
+        client.write_all(&image(4, 2, [255, 0, 0, 128])).unwrap();
         assert!(
-            within(|| latest_fill(&state) == Some(0xAB)),
-            "frame was never accepted"
+            within(|| latest_px(&state) == Some([128, 0, 0, 128])),
+            "frame was never accepted (or not premultiplied)"
         );
         let held = state.latest.lock().unwrap();
         let f = held.as_ref().unwrap();
         assert_eq!((f.width, f.height), (4, 2));
-        assert_eq!(f.rgba.len(), 4 * 2 * 4, "payload must be exactly w*h*4");
+        assert_eq!(f.rgba.len(), 4 * 2 * 4, "kept as w*h*4 premultiplied RGBA");
         drop(held);
 
         drop(client);
         h.join().unwrap();
     }
 
-    // The kiosk must fall back to the built-in clock the moment the streaming client goes away --
-    // never keep painting a frozen last frame on a locked machine.
+    #[test]
+    fn an_rgb_image_is_accepted_as_opaque() {
+        let state = with_output();
+        let (mut client, h) = serve(&state);
+        let mut v = b"P7\nWIDTH 2\nHEIGHT 1\nDEPTH 3\nMAXVAL 255\nTUPLTYPE RGB\nENDHDR\n".to_vec();
+        v.extend_from_slice(&[9, 8, 7, 9, 8, 7]);
+        client.write_all(&v).unwrap();
+        assert!(within(|| latest_px(&state) == Some([9, 8, 7, 255])));
+        drop(client);
+        h.join().unwrap();
+    }
+
+    // Any accepted size is kept; fitting it to the output is the paint path's job (`fit`), so a size that differs from
+    // the output's is no reason to drop it any more.
+    #[test]
+    fn images_of_any_size_are_kept_and_the_newest_wins() {
+        let state = with_output();
+        let (mut client, h) = serve(&state);
+        client.write_all(&image(8, 2, [1, 1, 1, 255])).unwrap();
+        assert!(within(|| latest_px(&state) == Some([1, 1, 1, 255])));
+        client.write_all(&image(3, 5, [2, 2, 2, 255])).unwrap();
+        assert!(within(|| latest_px(&state) == Some([2, 2, 2, 255])));
+        let held = state.latest.lock().unwrap();
+        assert_eq!(held.as_ref().map(|f| (f.width, f.height)), Some((3, 5)));
+        drop(held);
+        drop(client);
+        h.join().unwrap();
+    }
+
+    // The kiosk must fall back to the built-in clock the moment the streaming client goes away -- never keep painting a
+    // frozen last frame on a locked machine.
     #[test]
     fn a_disconnect_clears_the_frame_so_the_kiosk_falls_back_to_the_clock() {
-        let state = SocketState::new();
-        state.set_geometry(4, 2, 1);
+        let state = with_output();
         let (mut client, h) = serve(&state);
 
-        client.write_all(&frame(4, 2, 0x11)).unwrap();
-        assert!(within(|| latest_fill(&state) == Some(0x11)));
+        client
+            .write_all(&image(4, 2, [0x11, 0x11, 0x11, 255]))
+            .unwrap();
+        assert!(within(|| latest_px(&state).is_some()));
 
         drop(client);
         h.join().unwrap();
@@ -324,127 +463,98 @@ mod tests {
         );
     }
 
-    // A mismatched frame is DROPPED, not fatal: the connection must survive it, which is why the
-    // second (matching) frame has to land on the same stream.
-    #[test]
-    fn a_wrong_geometry_frame_is_dropped_and_the_connection_is_kept() {
-        let state = SocketState::new();
-        state.set_geometry(4, 2, 1);
-        let (mut client, h) = serve(&state);
-
-        // Sent ALONE and checked before anything else is written: sending a good frame after it
-        // and inspecting the result cannot distinguish "the bad one was dropped" from "the bad one
-        // was accepted and then overwritten".
-        client.write_all(&frame(8, 2, 0x22)).unwrap();
-        assert!(
-            stays_empty(&state),
-            "a frame whose geometry does not match the kiosk output was blitted"
-        );
-
-        // The drop must not have killed the connection -- the same stream still works.
-        client.write_all(&frame(4, 2, 0x33)).unwrap();
-        assert!(
-            within(|| latest_fill(&state) == Some(0x33)),
-            "the connection did not survive a dropped frame"
-        );
-
-        drop(client);
-        h.join().unwrap();
-    }
-
     #[test]
     fn no_frame_ever_sent_means_no_frame_to_show() {
-        let state = SocketState::new();
-        state.set_geometry(4, 2, 1);
+        let state = with_output();
         let (client, h) = serve(&state);
         drop(client);
         h.join().unwrap();
         assert!(state.latest.lock().unwrap().is_none());
     }
 
-    // A frame that arrives before the compositor has configured the kiosk surface (geometry still
-    // 0,0,0) cannot match anything, so it must be dropped rather than blitted at a guessed size.
+    // Before the compositor has described the kiosk output (or with none configured) there is nothing to show a frame
+    // on: frames are read and discarded, and the connection is kept for when there is.
     #[test]
-    fn a_frame_arriving_before_the_kiosk_has_geometry_is_dropped() {
+    fn frames_without_a_kiosk_output_are_discarded_and_the_connection_kept() {
         let state = SocketState::new();
         let (mut client, h) = serve(&state);
 
-        client.write_all(&frame(4, 2, 0x44)).unwrap();
+        client.write_all(&image(4, 2, [0x44, 0, 0, 255])).unwrap();
         assert!(
             stays_empty(&state),
-            "a frame was blitted at a guessed size before the compositor configured the kiosk"
+            "a frame was kept while there was no kiosk output"
         );
+
+        state.set_kiosk_output(true);
+        client.write_all(&image(4, 2, [0x45, 0, 0, 255])).unwrap();
+        assert!(
+            within(|| latest_px(&state) == Some([0x45, 0, 0, 255])),
+            "the connection did not survive the discarded frame"
+        );
+
+        // Losing the kiosk output drops the held frame at once.
+        state.set_kiosk_output(false);
+        assert!(state.latest.lock().unwrap().is_none());
 
         drop(client);
         h.join().unwrap();
     }
 
-    // ── defensive length handling ────────────────────────────────────────────────────────────
+    // ── DISPLAY-4: what closes the connection ────────────────────────────────────────────────
 
-    // A garbled or hostile length prefix must not become a huge allocation: the header alone has
-    // to end the connection, WITHOUT the payload ever being read.
-    //
-    // Asserted as "the client observes EOF while it is still connected and has sent no payload".
-    // The obvious alternative -- send a header and check the handler exited -- cannot fail: if the
-    // cap were gone the handler would block in `read_exact` forever and the test would HANG rather
-    // than fail. A read timeout turns that same mutation into a clean failure.
-    //
-    // Sized just past the cap on purpose. At 0xFFFF x 0xFFFF a removed cap aborts the test process
-    // on a ~17 GiB reservation, which is also not a legible failure.
     #[test]
-    fn an_implausibly_large_frame_closes_the_connection_without_reading_the_payload() {
-        const W: u32 = 4097;
-        const H: u32 = 4096;
-        assert!(
-            (W as usize) * (H as usize) * 4 > MAX_FRAME_BYTES,
-            "this test is only meaningful above the cap"
-        );
-
-        let state = SocketState::new();
-        state.set_geometry(4, 2, 1);
+    fn a_refused_header_closes_the_connection() {
+        let state = with_output();
         let (mut client, h) = serve(&state);
-
-        let mut header = Vec::new();
-        header.extend_from_slice(&W.to_le_bytes());
-        header.extend_from_slice(&H.to_le_bytes());
-        client.write_all(&header).unwrap();
-
         client
-            .set_read_timeout(Some(Duration::from_secs(5)))
+            .write_all(b"P7\nWIDTH 1\nHEIGHT 1\nDEPTH 1\nMAXVAL 255\nTUPLTYPE GRAYSCALE\nENDHDR\n")
             .unwrap();
-        let mut sink = [0u8; 1];
-        assert_eq!(
-            client.read(&mut sink).ok(),
-            Some(0),
-            "the server should have closed on the header alone; it is still reading the payload"
+        assert!(closed_by_server(&mut client));
+        h.join().unwrap();
+        assert!(state.latest.lock().unwrap().is_none());
+    }
+
+    // The header alone has to end the connection, WITHOUT the raster ever being read: asserted as "the client observes
+    // EOF while it is still connected and has sent no raster". Sending a header and checking the handler exited could
+    // not fail: without the limit the handler would block reading the raster and the test would HANG.
+    #[test]
+    fn an_oversized_image_closes_the_connection_on_the_header_alone() {
+        let state = with_output();
+        let (mut client, h) = serve(&state);
+        client
+            .write_all(
+                b"P7\nWIDTH 8193\nHEIGHT 8\nDEPTH 4\nMAXVAL 255\nTUPLTYPE RGB_ALPHA\nENDHDR\n",
+            )
+            .unwrap();
+        assert!(
+            closed_by_server(&mut client),
+            "the server should have closed on the header alone; it is still reading the raster"
         );
-
         h.join().unwrap();
-        assert!(state.latest.lock().unwrap().is_none());
     }
 
     #[test]
-    fn a_zero_sized_frame_closes_the_connection() {
-        let state = SocketState::new();
-        state.set_geometry(4, 2, 1);
+    fn a_header_past_one_kib_closes_the_connection() {
+        let state = with_output();
         let (mut client, h) = serve(&state);
-        let _ = client.write_all(&[0u8; 8]);
+        let mut v = b"P7\n".to_vec();
+        while v.len() < 2048 {
+            v.extend_from_slice(b"# a very long comment that never ends the header\n");
+        }
+        client.write_all(&v).unwrap();
+        assert!(closed_by_server(&mut client));
         h.join().unwrap();
-        assert!(state.latest.lock().unwrap().is_none());
     }
 
-    // A stream that ends mid-payload cannot be resynchronized, so it is treated exactly like a
-    // disconnect -- and must not leave a half-read buffer on screen.
+    // A stream that ends mid-image cannot be resynchronized, so it is treated exactly like a disconnect -- and must not
+    // leave a half-read buffer on screen.
     #[test]
-    fn a_truncated_frame_is_treated_as_a_disconnect() {
-        let state = SocketState::new();
-        state.set_geometry(4, 2, 1);
+    fn a_truncated_image_is_treated_as_a_disconnect() {
+        let state = with_output();
         let (mut client, h) = serve(&state);
-
-        let full = frame(4, 2, 0x55);
+        let full = image(4, 2, [0x55, 0x55, 0x55, 255]);
         client.write_all(&full[..full.len() - 4]).unwrap();
         drop(client);
-
         h.join().unwrap();
         assert!(
             state.latest.lock().unwrap().is_none(),
@@ -452,14 +562,140 @@ mod tests {
         );
     }
 
-    // ── one client at a time ─────────────────────────────────────────────────────────────────
+    // An image that has started but stops arriving closes the connection at the deadline (10 s in production; short
+    // here). The client is still connected and simply sends nothing more.
+    #[test]
+    fn a_stalled_image_closes_the_connection_at_the_deadline() {
+        let state = with_output();
+        let (mut client, h) = serve_with(&state, Duration::from_millis(200));
+        let full = image(4, 2, [0x66, 0, 0, 255]);
+        let started = Instant::now();
+        client.write_all(&full[..full.len() / 2]).unwrap();
+        assert!(
+            closed_by_server(&mut client),
+            "a stalled image was waited on"
+        );
+        assert!(
+            started.elapsed() >= Duration::from_millis(200),
+            "closed before the deadline"
+        );
+        h.join().unwrap();
+        assert!(state.latest.lock().unwrap().is_none());
+    }
 
-    // A superseded connection's handler exits late. It must not clear the frame the NEW connection
-    // has already published, which would blink the kiosk back to the clock for no reason.
+    // One deadline for the whole image, not per read: steady progress one byte at a time is still let go at the deadline.
+    #[test]
+    fn a_trickling_image_is_let_go_at_one_deadline() {
+        let state = with_output();
+        let (client, h) = serve_with(&state, Duration::from_millis(300));
+        let started = Instant::now();
+        let stop = Arc::new(AtomicBool::new(false));
+        let (mut writer, halt) = (client.try_clone().unwrap(), Arc::clone(&stop));
+        let trickle = std::thread::spawn(move || {
+            for b in image(64, 64, [1, 2, 3, 255]) {
+                if halt.load(Ordering::SeqCst) || writer.write_all(&[b]).is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        });
+        // Bounded, so a per-read timeout (which this trickle never trips) fails the test instead of hanging it.
+        let let_go = within(|| h.is_finished());
+        let held = started.elapsed();
+        stop.store(true, Ordering::SeqCst);
+        trickle.join().unwrap();
+        assert!(
+            let_go && held < Duration::from_secs(2),
+            "one byte every 20 ms held the connection for {held:?}"
+        );
+        h.join().unwrap();
+        drop(client);
+        assert!(state.latest.lock().unwrap().is_none());
+    }
+
+    // Quiet BETWEEN images is not a stall: a client may send one frame and the next much later.
+    #[test]
+    fn a_quiet_client_between_images_is_kept() {
+        let state = with_output();
+        let (mut client, h) = serve_with(&state, Duration::from_millis(100));
+        client.write_all(&image(2, 2, [7, 0, 0, 255])).unwrap();
+        assert!(within(|| latest_px(&state) == Some([7, 0, 0, 255])));
+        std::thread::sleep(Duration::from_millis(400));
+        client.write_all(&image(2, 2, [8, 0, 0, 255])).unwrap();
+        assert!(
+            within(|| latest_px(&state) == Some([8, 0, 0, 255])),
+            "the connection was closed while the client was quiet between images"
+        );
+        drop(client);
+        h.join().unwrap();
+    }
+
+    // ── the listener: no greeting, same user, one client at a time ─────────────────────────────
+
+    fn listening() -> (PathBuf, Arc<SocketState>) {
+        let dir = std::env::temp_dir().join(format!(
+            "clck-socket-test-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::SeqCst)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("clck.sock");
+        let state = with_output();
+        spawn(path.clone(), Arc::clone(&state));
+        assert!(
+            within(|| UnixStream::connect(&path).is_ok()),
+            "never listened"
+        );
+        // that probe connection was a client too; let it go before the test's own
+        assert!(within(|| state.active_stream.lock().unwrap().is_some()));
+        (path, state)
+    }
+
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn the_server_says_nothing_and_a_same_user_client_is_admitted() {
+        let (path, state) = listening();
+        let mut client = UnixStream::connect(&path).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        let mut sink = [0u8; 1];
+        match client.read(&mut sink) {
+            Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
+            other => panic!("the server wrote or closed instead of staying silent: {other:?}"),
+        }
+        client.write_all(&image(2, 2, [3, 4, 5, 255])).unwrap();
+        assert!(within(|| latest_px(&state) == Some([3, 4, 5, 255])));
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn the_peer_uid_is_the_kernels_and_is_this_user_for_our_own_socket() {
+        let (a, _b) = UnixStream::pair().unwrap();
+        assert_eq!(peer_uid(&a).unwrap(), own_uid());
+    }
+
+    // A new client replaces the previous one, which is shut down; the newest one's frames are the ones shown.
+    #[test]
+    fn the_latest_client_wins_and_the_previous_one_is_closed() {
+        let (path, state) = listening();
+        let mut first = UnixStream::connect(&path).unwrap();
+        first.write_all(&image(2, 2, [1, 0, 0, 255])).unwrap();
+        assert!(within(|| latest_px(&state) == Some([1, 0, 0, 255])));
+
+        let mut second = UnixStream::connect(&path).unwrap();
+        assert!(closed_by_server(&mut first), "the replaced client was kept");
+        second.write_all(&image(2, 2, [2, 0, 0, 255])).unwrap();
+        assert!(within(|| latest_px(&state) == Some([2, 0, 0, 255])));
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    // A superseded connection's handler exits late. It must not clear the frame the NEW connection has already
+    // published, which would blink the kiosk back to the clock for no reason.
     #[test]
     fn a_superseded_connection_does_not_clear_the_newer_frame() {
-        let state = SocketState::new();
-        state.set_geometry(4, 2, 1);
+        let state = with_output();
 
         let (client_old, h_old) = serve(&state);
         // A newer connection takes over the generation while the old handler is still alive.
@@ -474,70 +710,113 @@ mod tests {
         h_old.join().unwrap();
 
         assert_eq!(
-            latest_fill(&state),
-            Some(0x66),
+            latest_px(&state),
+            Some([0x66; 4]),
             "the old connection's exit stomped the live frame"
         );
     }
 
-    // ── HELLO wire format ────────────────────────────────────────────────────────────────────
+    // ── fitting a frame to the output ────────────────────────────────────────────────────────
 
-    #[test]
-    fn hello_is_the_magic_then_three_little_endian_u32s() {
-        let (mut server, mut client) = UnixStream::pair().unwrap();
-        write_hello(&mut server, 3840, 2160, 2).unwrap();
-        drop(server);
-
-        let mut got = Vec::new();
-        client.read_to_end(&mut got).unwrap();
-
-        assert_eq!(got.len(), 20, "HELLO is 8 magic + 3 u32");
-        assert_eq!(&got[0..8], MAGIC);
-        assert_eq!(u32::from_le_bytes(got[8..12].try_into().unwrap()), 3840);
-        assert_eq!(u32::from_le_bytes(got[12..16].try_into().unwrap()), 2160);
-        assert_eq!(u32::from_le_bytes(got[16..20].try_into().unwrap()), 2);
+    fn solid(width: u32, height: u32, px: [u8; 4]) -> LatestFrame {
+        LatestFrame {
+            width,
+            height,
+            rgba: px.repeat((width * height) as usize),
+        }
     }
 
-    // `0,0,0` is the documented "no kiosk output" answer a client must be able to distinguish.
-    #[test]
-    fn hello_reports_zero_geometry_when_there_is_no_kiosk_output() {
-        let (mut server, mut client) = UnixStream::pair().unwrap();
-        let (w, h, s) = *SocketState::new().geometry.lock().unwrap();
-        write_hello(&mut server, w, h, s).unwrap();
-        drop(server);
+    fn at(buf: &[u8], width: u32, x: u32, y: u32) -> [u8; 4] {
+        let i = ((y * width + x) * 4) as usize;
+        buf[i..i + 4].try_into().unwrap()
+    }
 
-        let mut got = Vec::new();
-        client.read_to_end(&mut got).unwrap();
-        assert_eq!(&got[8..20], &[0u8; 12]);
+    const BLACK: [u8; 4] = [0, 0, 0, 255];
+    const RED: [u8; 4] = [255, 0, 0, 255];
+
+    #[test]
+    fn a_matching_frame_is_shown_one_to_one() {
+        let mut f = solid(3, 2, RED);
+        f.rgba[4..8].copy_from_slice(&[1, 2, 3, 4]);
+        assert_eq!(f.fit(3, 2).unwrap(), f.rgba, "byte for byte");
+    }
+
+    #[test]
+    fn a_wider_frame_is_letterboxed_centred_on_black() {
+        // 4x1 onto 4x4: scale 1, 4x1 band in rows 1..2 (offset floor(3/2) = 1)
+        let out = solid(4, 1, RED).fit(4, 4).unwrap();
+        assert_eq!(out.len(), 4 * 4 * 4);
+        for x in 0..4 {
+            assert_eq!(at(&out, 4, x, 0), BLACK);
+            assert_eq!(at(&out, 4, x, 1), RED);
+            assert_eq!(at(&out, 4, x, 2), BLACK);
+            assert_eq!(at(&out, 4, x, 3), BLACK);
+        }
+    }
+
+    #[test]
+    fn a_taller_frame_is_pillarboxed_and_scaled_up() {
+        // 1x2 onto 6x4: scale 2, a 2x4 column at x 2..4
+        let out = solid(1, 2, RED).fit(6, 4).unwrap();
+        for y in 0..4 {
+            assert_eq!(at(&out, 6, 0, y), BLACK);
+            assert_eq!(at(&out, 6, 1, y), BLACK);
+            assert_eq!(at(&out, 6, 2, y), RED);
+            assert_eq!(at(&out, 6, 3, y), RED);
+            assert_eq!(at(&out, 6, 4, y), BLACK);
+            assert_eq!(at(&out, 6, 5, y), BLACK);
+        }
+    }
+
+    #[test]
+    fn a_larger_frame_is_scaled_down_to_fill_the_same_aspect() {
+        // 384x216 onto 192x108 (a 16:9 frame at twice the kiosk's size): no bars at all
+        let out = solid(384, 216, RED).fit(192, 108).unwrap();
+        assert_eq!(out.len(), 192 * 108 * 4);
+        for (x, y) in [(0, 0), (191, 0), (0, 107), (191, 107), (96, 54)] {
+            assert_eq!(at(&out, 192, x, y), RED, "({x},{y})");
+        }
+    }
+
+    #[test]
+    fn a_transparent_frame_shows_black_where_it_is_clear() {
+        let out = solid(2, 2, [0, 0, 0, 0]).fit(4, 2).unwrap();
+        for x in 0..4 {
+            assert_eq!(at(&out, 4, x, 0), BLACK);
+        }
     }
 
     // ── DISPLAY-2 ────────────────────────────────────────────────────────────────────────────
 
-    // The socket is display-only, permanently. Asserted against the module's own source rather
-    // than a comment, so that ADDING a path from received bytes to the password buffer, the auth
-    // state, or the unlock call fails the build instead of a review.
+    // The socket is display-only, permanently. Asserted against the sources of the socket and of the image decoder it
+    // feeds rather than a comment, so that ADDING a path from received bytes to the password buffer, the auth state, or
+    // the unlock call fails the build instead of a review.
     //
-    // Scoped to the code above `#[cfg(test)]`: this test module necessarily says these words.
+    // Scoped to the code above `#[cfg(test)]`: these test modules necessarily say these words.
     #[test]
     fn the_socket_module_has_no_route_to_authentication_or_unlock() {
-        let source = include_str!("socket.rs");
-        let code = source.split("#[cfg(test)]").next().unwrap();
-        let stripped: String = code
-            .lines()
-            .map(|l| match l.find("//") {
-                Some(i) => &l[..i],
-                None => l,
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-            .to_lowercase();
+        for (name, source) in [
+            ("socket.rs", include_str!("socket.rs")),
+            ("netpbm.rs", include_str!("netpbm.rs")),
+        ] {
+            let code = source.split("#[cfg(test)]").next().unwrap();
+            let stripped: String = code
+                .lines()
+                .map(|l| match l.find("//") {
+                    Some(i) => &l[..i],
+                    None => l,
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+                .to_lowercase();
 
-        for forbidden in ["unlock", "password", "pam", "auth"] {
-            assert!(
-                !stripped.contains(forbidden),
-                "socket.rs code references `{forbidden}`: the kiosk display socket must never be \
-                 able to reach authentication or the unlock call (BEHAVIORS.md DISPLAY-2)"
-            );
+            for forbidden in ["unlock", "password", "pam", "auth"] {
+                assert!(
+                    !stripped.contains(forbidden),
+                    "{name} code references `{forbidden}`: the kiosk display socket must never be able to reach \
+                     authentication or the unlock call (BEHAVIORS.md DISPLAY-2)"
+                );
+            }
         }
     }
 
@@ -546,18 +825,18 @@ mod tests {
     // These mutate a process-global env var, so they are one test rather than three racing ones.
     #[test]
     fn resolve_path_prefers_the_configured_value_then_xdg_then_gives_up() {
-        let configured = Path::new("/run/custom/nixlock.sock");
+        let configured = Path::new("/run/custom/kiosk.sock");
 
         std::env::set_var("XDG_RUNTIME_DIR", "/run/user/1000");
         assert_eq!(resolve_path(Some(configured)).unwrap(), configured);
         assert_eq!(
             resolve_path(None).unwrap(),
-            PathBuf::from("/run/user/1000/nixlock.sock")
+            PathBuf::from("/run/user/1000/clck.sock")
         );
 
         std::env::remove_var("XDG_RUNTIME_DIR");
-        // No socket is a silent degrade to the built-in clock, never a startup failure -- a
-        // display feature must not be able to stop the lock from coming up.
+        // No socket is a silent degrade to the built-in clock, never a startup failure -- a display feature must not be
+        // able to stop the lock from coming up.
         assert!(resolve_path(None).is_none());
         assert_eq!(resolve_path(Some(configured)).unwrap(), configured);
     }

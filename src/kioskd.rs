@@ -11,9 +11,10 @@
 //! exact-name rule as the locker's kiosk role).
 //!
 //! Frames: its OWN live socket (`live_socket`, default `$XDG_RUNTIME_DIR/clck-live.sock`), never the locker's, so the locker's
-//! rule that only the accepted locker publishes ITS socket is untouched. The wire is the same content-blind one
-//! (`crate::socket`): a client such as cksk connects, is told the kiosk output's geometry and streams frames; the latest valid
-//! one is kept and painted while the kiosk is on. A client may stay connected for good: it costs nothing here until `on`.
+//! rule that only the accepted locker publishes ITS socket is untouched. The frame input is the same content-blind one
+//! (`crate::socket`): a client such as cksk connects and writes Netpbm PAM images; the latest one is kept and painted while
+//! the kiosk is on, 1:1 when its size matches the output and scaled to fit otherwise. A client may stay connected for good:
+//! nothing is painted until `on`.
 //!
 //! Wakeups: the control socket and the compositor's events; a one-second clock repaint only while the kiosk is on.
 
@@ -230,29 +231,20 @@ impl Kiosk {
             .unwrap_or_default()
     }
 
-    /// The geometry a frame client is told, from the first kiosk output the compositor has described, so a client can
-    /// connect and stream while the kiosk is still off.
-    fn publish_geometry(&self) {
-        let g = self
+    /// Whether a kiosk output the compositor has described (named and sized) exists, so a client's frames are kept while
+    /// the kiosk is still off and discarded while there is nothing to show them on.
+    fn publish_kiosk_output(&self) {
+        let present = self
             .output_state
             .outputs()
             .filter_map(|o| self.output_state.info(&o))
-            .find(|i| {
+            .any(|i| {
                 i.name
                     .as_deref()
                     .is_some_and(|n| role_for(&self.kiosk_outputs, n) == OutputRole::Kiosk)
-            })
-            .and_then(|i| {
-                i.logical_size.map(|(w, h)| {
-                    (
-                        w.max(0) as u32,
-                        h.max(0) as u32,
-                        i.scale_factor.max(1) as u32,
-                    )
-                })
-            })
-            .unwrap_or((0, 0, 1));
-        self.socket.set_geometry(g.0, g.1, g.2);
+                    && i.logical_size.is_some_and(|(w, h)| w > 0 && h > 0)
+            });
+        self.socket.set_kiosk_output(present);
     }
 
     fn add_surface(&mut self, qh: &QueueHandle<Self>, output: wl_output::WlOutput) {
@@ -386,11 +378,12 @@ impl Kiosk {
             return;
         }
         let expect = (w * h * 4) as usize;
-        let streamed = self.socket.latest.lock().ok().and_then(|l| {
-            l.as_ref()
-                .filter(|f| f.width == w && f.height == h)
-                .map(|f| f.rgba.clone())
-        });
+        let streamed = self
+            .socket
+            .latest
+            .lock()
+            .ok()
+            .and_then(|l| l.as_ref().and_then(|f| f.fit(w, h)));
         let rgba = streamed.filter(|b| b.len() == expect).unwrap_or_else(|| {
             self.clock.paint(&Frame {
                 role: OutputRole::Kiosk,
@@ -497,7 +490,7 @@ pub fn run(config: Config) -> Result<(), Error> {
     event_queue
         .roundtrip(&mut kiosk)
         .map_err(|e| Error::Wayland(e.to_string()))?;
-    kiosk.publish_geometry();
+    kiosk.publish_kiosk_output();
 
     // Advertised last: a control socket exists only once this daemon can act on a command (a daemon that failed to reach
     // the compositor leaves no socket behind for `kiosk status` to be refused on).
@@ -606,7 +599,7 @@ impl OutputHandler for Kiosk {
         &mut self.output_state
     }
     fn new_output(&mut self, _: &Connection, qh: &QueueHandle<Self>, output: wl_output::WlOutput) {
-        self.publish_geometry();
+        self.publish_kiosk_output();
         if self.on {
             self.add_surface(qh, output);
         }
@@ -617,7 +610,7 @@ impl OutputHandler for Kiosk {
         qh: &QueueHandle<Self>,
         output: wl_output::WlOutput,
     ) {
-        self.publish_geometry();
+        self.publish_kiosk_output();
         // A name that arrives after the output (the compositor describes it in pieces) makes it eligible now.
         if self.on {
             self.add_surface(qh, output);
@@ -630,7 +623,7 @@ impl OutputHandler for Kiosk {
         output: wl_output::WlOutput,
     ) {
         self.entries.retain(|e| e.output != output);
-        self.publish_geometry();
+        self.publish_kiosk_output();
     }
 }
 
@@ -869,7 +862,7 @@ mod tests {
         .unwrap();
         assert!(e.to_string().contains("must not be the control"), "{e}");
         // the locker's DEFAULT path (nothing configured) is passed in already resolved: the same refusal
-        let default = d.0.join("nixlock.sock");
+        let default = d.0.join("clck.sock");
         assert!(validate_paths(Some(&default), &d.0.join("c.sock"), Some(&default)).is_err());
         // an unrelated path, a file there, a live socket there
         let ok = d.0.join("live.sock");

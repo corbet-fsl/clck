@@ -181,7 +181,7 @@ dependencies = [
 
 [[package]]
 name = "clck-kiosk"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "calloop",
  "calloop-wayland-source",
@@ -189,6 +189,7 @@ dependencies = [
  "fontdue",
  "libc",
  "pam-client",
+ "rustix",
  "serde",
  "serde_json",
  "smithay-client-toolkit",

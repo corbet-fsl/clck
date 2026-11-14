@@ -64,10 +64,10 @@ pub struct Config {
     /// Username to authenticate; `None` = the current `$USER`.
     pub username: Option<String>,
     /// Path to the kiosk display Unix socket. `None` (the default) resolves to
-    /// `$XDG_RUNTIME_DIR/nixlock.sock` at startup; if that env var is also unset the socket server
+    /// `$XDG_RUNTIME_DIR/clck.sock` at startup; if that env var is also unset the socket server
     /// is skipped entirely (the kiosk output then always shows the built-in clock) -- a display
-    /// feature must never block or weaken the lock itself. See `crate::socket` for the wire
-    /// protocol a client streams frames over.
+    /// feature must never block or weaken the lock itself. See `crate::socket` for the frame
+    /// input (Netpbm PAM images) a client streams.
     pub socket_path: Option<PathBuf>,
     /// Emit credential-blind lifecycle and PAM result events to stderr. The seated session's
     /// systemd unit captures stderr in journald. No password content, length, key symbol, PAM
@@ -387,8 +387,7 @@ struct Entry {
     name: String,
     width: u32,
     height: u32,
-    /// The output's scale factor, forwarded into the socket HELLO for `Kiosk`-role entries so a
-    /// client can render at the right density. `1` when the compositor never reports one.
+    /// The output's scale factor, for the diagnostics. `1` when the compositor never reports one.
     scale: u32,
 }
 
@@ -408,8 +407,8 @@ struct Locker {
     /// output; see `content.rs`'s header). Painted whenever the socket has no valid current frame.
     kiosk_fallback: ClockLockScreen,
     session_content: Box<dyn KioskContent>,
-    /// The kiosk display socket's shared state (`crate::socket`) — the latest streamed frame, the
-    /// kiosk output's current geometry (written here on `configure`), and the repaint ping.
+    /// The kiosk display socket's shared state (`crate::socket`) — the latest streamed frame,
+    /// whether a configured kiosk output exists (written here on `configure`), and the repaint ping.
     socket: Arc<SocketState>,
     /// Resolved during startup and consumed only after `SessionLockHandler::locked` confirms this
     /// process owns the compositor lock. Until then, the existing socket path belongs to the
@@ -465,14 +464,13 @@ impl Locker {
         (name, role, scale)
     }
 
-    fn refresh_kiosk_geometry(&self) {
-        let geometry = self
+    /// Frames are kept only while a configured kiosk surface exists to paint them on.
+    fn refresh_kiosk_output(&self) {
+        let present = self
             .surfaces
             .iter()
-            .find(|entry| entry.role == OutputRole::Kiosk && entry.width > 0 && entry.height > 0)
-            .map(|entry| (entry.width, entry.height, entry.scale))
-            .unwrap_or((0, 0, 1));
-        self.socket.set_geometry(geometry.0, geometry.1, geometry.2);
+            .any(|entry| entry.role == OutputRole::Kiosk && entry.width > 0 && entry.height > 0);
+        self.socket.set_kiosk_output(present);
     }
 
     fn add_output_surface(
@@ -530,7 +528,7 @@ impl Locker {
         entry.scale = scale;
         self.diagnostics
             .output_surface_updated(&entry.name, entry.role, entry.scale);
-        self.refresh_kiosk_geometry();
+        self.refresh_kiosk_output();
         self.render_surface(idx);
     }
 
@@ -546,7 +544,7 @@ impl Locker {
         eprintln!("clck: output removed: '{}' ({:?})", entry.name, entry.role);
         self.diagnostics
             .output_surface_removed(&entry.name, entry.role);
-        self.refresh_kiosk_geometry();
+        self.refresh_kiosk_output();
     }
 
     fn auth_view(&self) -> AuthView {
@@ -579,15 +577,12 @@ impl Locker {
         }
         let av = self.auth_view();
         let expect = (w * h * 4) as usize;
-        // A `Kiosk` output blits the latest socket frame when one exists and its geometry matches
-        // this surface exactly; otherwise (no client yet, a disconnect, or a stale/mismatched
-        // size) it falls back to the built-in clock, same as `Session` — DISPLAY-1.
+        // A `Kiosk` output blits the latest socket frame when one exists: 1:1 when its size
+        // matches this surface, scaled to fit (aspect kept, centred on black) otherwise. With no
+        // frame (no client yet, or a disconnect) it falls back to the built-in clock — DISPLAY-1.
         let socket_frame = if role == OutputRole::Kiosk {
             let latest = self.socket.latest.lock().unwrap();
-            latest
-                .as_ref()
-                .filter(|f| f.width == w && f.height == h)
-                .map(|f| f.rgba.clone())
+            latest.as_ref().and_then(|f| f.fit(w, h))
         } else {
             None
         };
@@ -865,10 +860,9 @@ impl SessionLockHandler for Locker {
                 h,
                 self.surfaces[idx].scale,
             );
-            // The one (v1) kiosk output's geometry is what a connecting socket client's HELLO
-            // reports, and what an already-connected client's frames are validated against — keep
-            // it current on every configure, including a later resize or hot-unplug.
-            self.refresh_kiosk_geometry();
+            // Whether a configured kiosk surface exists decides whether received frames are kept
+            // at all — keep it current on every configure, including a later resize or hot-unplug.
+            self.refresh_kiosk_output();
             self.render_surface(idx);
         }
     }

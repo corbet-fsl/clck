@@ -5,11 +5,11 @@
 //! role. CPU/`wl_shm` rendered — no GL/Mesa — so it drops into any wlroots compositor.
 //!
 //! clck is a **display SERVER**, not a library API for kiosk content: it listens on a Unix
-//! socket (`$XDG_RUNTIME_DIR/nixlock.sock` by default, or `Config::socket_path`) and blits
-//! whatever premultiplied-RGBA frames a client streams in onto the kiosk output — see the module
-//! docs on `socket` (crate-internal) or `BEHAVIORS.md`'s `DISPLAY-*` entries for the exact wire
-//! format. Until a frame arrives, or once the client disconnects, the kiosk output shows clck's
-//! own built-in clock instead. That socket is **display-only**: nothing it carries can ever reach
+//! socket (`$XDG_RUNTIME_DIR/clck.sock` by default, or `Config::socket_path`) and shows the
+//! Netpbm PAM images a client streams in on the kiosk output, 1:1 when the size matches and
+//! scaled to fit otherwise — see the README's "Frame input" section, the module docs on `socket`
+//! (crate-internal), or `BEHAVIORS.md`'s `DISPLAY-*` entries. Until a frame arrives, or once the
+//! client disconnects, the kiosk output shows clck's own built-in clock instead. That socket is **display-only**: nothing it carries can ever reach
 //! password verification or the unlock call (`DISPLAY-2`).
 //!
 //! ```no_run
@@ -18,7 +18,7 @@
 //!     kiosk_outputs: vec!["DP-3".into()],
 //!     pam_service: "clck".into(),
 //!     username: None,
-//!     socket_path: None, // default: $XDG_RUNTIME_DIR/nixlock.sock
+//!     socket_path: None, // default: $XDG_RUNTIME_DIR/clck.sock
 //!     debug: false,
 //!     fingerprint_pam_service: None, // e.g. Some("clck-fingerprint".into())
 //! }).unwrap();
@@ -38,6 +38,7 @@ mod fingerprint;
 pub mod kioskd;
 mod locker;
 mod lockscreen;
+mod netpbm;
 mod socket;
 mod theme;
 

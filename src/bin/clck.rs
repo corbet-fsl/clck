@@ -1,6 +1,6 @@
 //! The default `clck` binary: a swaylock-compatible clock locker (the shipped `ClockLockScreen`
-//! on every `Session` output). A `Kiosk` output shows whatever a client streams over the kiosk
-//! display Unix socket (e.g. `nixwatch-frames`) -- see `clck::socket`'s wire protocol -- and
+//! on every `Session` output). A `Kiosk` output shows the Netpbm PAM images a client (e.g. cksk)
+//! streams over the kiosk display Unix socket -- see the README's "Frame input" section -- and
 //! the same built-in clock otherwise. Per-host values come from
 //! `$XDG_CONFIG_HOME/clck/config.json`, because swayidle only ever appends `-f`.
 
@@ -213,10 +213,12 @@ fn help() {
            tried in parallel with the password; unset, clck is password-only.\n\
          \n\
          The default binary shows the clock lock screen on every `Session` output. A `Kiosk`\n\
-         output shows whatever a client streams over the kiosk display Unix socket (DISPLAY-1) --\n\
-         socket_path, default $XDG_RUNTIME_DIR/nixlock.sock -- or the same built-in clock until a\n\
-         frame arrives / after the client disconnects. That socket is DISPLAY-ONLY: it can never\n\
-         unlock the session (DISPLAY-2); unlock is PAM-only, exactly as on every Session output."
+         output shows the Netpbm PAM images (P7, RGB_ALPHA or RGB, MAXVAL 255) a client of the\n\
+         same user writes to the kiosk display Unix socket (DISPLAY-1, DISPLAY-4) -- socket_path,\n\
+         default $XDG_RUNTIME_DIR/clck.sock -- 1:1 when the size matches, scaled to fit otherwise;\n\
+         or the same built-in clock until a frame arrives / after the client disconnects. That\n\
+         socket is DISPLAY-ONLY: it can never unlock the session (DISPLAY-2); unlock is PAM-only,\n\
+         exactly as on every Session output."
     );
 }
 

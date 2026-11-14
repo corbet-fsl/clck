@@ -1,7 +1,7 @@
 //! The content interface clck paints INTERNALLY: the `Session` (password) lock screen, always,
 //! and the `Kiosk` output's fallback clock whenever the socket has no live frame for it (see
 //! `crate::socket`). It is no longer a per-output plug-in API for kiosk content — that content now
-//! arrives over the Unix socket as raw premultiplied RGBA, content-blind to clck. A library
+//! arrives over the Unix socket as Netpbm PAM images, content-blind to clck. A library
 //! consumer's only remaining lever here is overriding the `Session` look via [`crate::builder`];
 //! the shipped [`crate::ClockLockScreen`] is the default for both `Session` and the `Kiosk`
 //! fallback.
